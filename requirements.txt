@@ -1,6 +1,8 @@
 pdfplumber>=0.11.0
+pypdf>=4.0.0
 fpdf2>=2.7.6
 python-dotenv>=1.0.0
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 python-multipart>=0.0.9
+supabase>=2.4.0

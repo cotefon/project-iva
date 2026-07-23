@@ -221,3 +221,5 @@ __marimo__/
 # docs
 docs/
 outputs/
+# Claude Code local config / tooling
+.claude/
