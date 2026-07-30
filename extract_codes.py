@@ -53,9 +53,9 @@ TARGET_CODES = ALL_CODES + [INVOICE_CODE]
 RATE = 0.19
 
 SPANISH_MONTHS = {
-    1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio",
-    7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre", 11: "Noviembre",
-    12: "Diciembre",
+    1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
+    7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov",
+    12: "Dic",
 }
 
 # A Chilean-formatted amount: 1-3 leading digits, then dot-grouped thousands.
@@ -228,10 +228,11 @@ def format_int(n) -> str:
 
 
 def variation_pct(prev, curr):
-    """Numeric month-over-month variation: (prev / curr - 1) * 100.
+    """Numeric year-over-year variation: (prev / curr - 1) * 100.
 
-    Returns None when undefined: no previous month, or a current value of 0/None
-    that would divide by zero.
+    `prev` is the figure for the *same month of the previous year*. Returns None
+    when undefined: no matching month a year earlier, or a current value of
+    0/None that would divide by zero.
     """
     if prev is None or not curr:
         return None
@@ -245,13 +246,13 @@ def format_pct(pct) -> str:
 
 
 def format_variation(prev, curr) -> str:
-    """Month-over-month variation as a percentage: (prev / curr - 1) * 100.
+    """Year-over-year variation as a percentage: (prev / curr - 1) * 100.
 
-    Compares a month's figure with the previous month's, per the reporting
-    convention requested (previous divided by current, minus one). Returns "—"
-    when undefined: no previous month, or a current value of 0/None that would
-    divide by zero. Formatted with a Chilean decimal comma and an explicit sign,
-    e.g. "+12,3%", "-4,0%".
+    Compares a month's figure with the same month of the previous year, per the
+    reporting convention requested (previous divided by current, minus one).
+    Returns "—" when undefined: no matching month a year earlier, or a current
+    value of 0/None that would divide by zero. Formatted with a Chilean decimal
+    comma and an explicit sign, e.g. "+12,3%", "-4,0%".
     """
     return format_pct(variation_pct(prev, curr))
 
@@ -331,13 +332,17 @@ def build_monthly_table(markdown: str) -> str:
         "Venta del mes: `020 + 142 + 538 / 0,19 + 587`  ·  "
         "Compras: `535 / 0,19 + 520 / 0,19 - 528 / 0,19 + 532 / 0,19 + 521 + 560 + 562`  ·  "
         "Las columnas *acumuladas* suman mes a mes dentro de cada año.  ·  "
-        "*Var.* = variación respecto al mes anterior `(mes anterior / mes actual) - 1`.",
+        "*Var.* = variación respecto al mismo mes del año anterior "
+        "`(mismo mes año anterior / mes actual) - 1`.",
         "",
     ]
 
     incomplete = []
-    prev_sales = prev_compras = None
-    for year, year_rows in group_rows_by_year(monthly_rows(markdown)):
+    all_rows = monthly_rows(markdown)
+    # Same month, previous year -> figure, for year-over-year variation.
+    sales_by_period = {(r["year"], r["month"]): r["sales"] for r in all_rows}
+    compras_by_period = {(r["year"], r["month"]): r["compras"] for r in all_rows}
+    for year, year_rows in group_rows_by_year(all_rows):
         lines += [
             f"## {year}",
             "",
@@ -350,6 +355,8 @@ def build_monthly_table(markdown: str) -> str:
         for r in year_rows:
             acc_sales += r["sales"]
             acc_compras += r["compras"]
+            prev_sales = sales_by_period.get((r["year"] - 1, r["month"]))
+            prev_compras = compras_by_period.get((r["year"] - 1, r["month"]))
             var_sales = format_variation(prev_sales, r["sales"])
             var_compras = format_variation(prev_compras, r["compras"])
             sales = format_int(r["sales"])
@@ -375,8 +382,6 @@ def build_monthly_table(markdown: str) -> str:
             tot_sales += r["sales"]
             tot_compras += r["compras"]
             tot_invoices += r["invoices"] or 0
-            prev_sales = r["sales"]
-            prev_compras = r["compras"]
         # Promedio row: yearly total per invoice (code 503) for Venta del mes and
         # Compras; the remaining columns have no per-invoice meaning ("—").
         avg_sales = per_invoice(tot_sales, tot_invoices)

@@ -74,12 +74,27 @@ def row_in_thousands(row: dict):
     return codes_k, sales_k, compras_k
 
 
+def thousands_by_period(rows: list[dict]) -> dict:
+    """Map {(year, month): (sales_k, compras_k)} in thousands, for looking up the
+    same month of the previous year when computing year-over-year variation."""
+    lookup = {}
+    for r in rows:
+        _, sales_k, compras_k = row_in_thousands(r)
+        lookup[(r["year"], r["month"])] = (sales_k, compras_k)
+    return lookup
+
+
+def prior_year(lookup: dict, row: dict):
+    """(sales_k, compras_k) for the same month one year earlier, or (None, None)."""
+    return lookup.get((row["year"] - 1, row["month"]), (None, None))
+
+
 def fmt(v) -> str:
-    """Format an integer with comma thousands separators (e.g. 1,872,854).
+    """Format an integer with Chilean dot thousands separators (e.g. 1.872.854).
 
     None (a missing code) renders as an em dash.
     """
-    return "—" if v is None else f"{v:,}"
+    return "—" if v is None else f"{v:,}".replace(",", ".")
 
 
 class _ColumnAverages(NamedTuple):
@@ -118,9 +133,7 @@ class _YearAggregator:
             v = per_invoice(total, self.tot_invoices)
             return None if v is None else round(v)
 
-        return _ColumnAverages(
-            sales=avg(self.tot_sales), compras=avg(self.tot_compras)
-        )
+        return _ColumnAverages(sales=avg(self.tot_sales), compras=avg(self.tot_compras))
 
 
 def pdf_to_rows(
@@ -198,38 +211,41 @@ async def extract(file: UploadFile = File(...)):
     """Return the monthly sales as JSON, all amounts in thousands of pesos."""
     _, rows = pdf_to_rows(await file.read(), file.filename or "")
 
-    # (prev / curr - 1) * 100, or None when undefined (no previous month, or a
-    # current value of 0). Compared month-over-month across years.
+    # (prev / curr - 1) * 100, or None when undefined (no matching month a year
+    # earlier, or a current value of 0). Compared against the same month of the
+    # previous year.
     def var_pct(prev, curr):
         return None if prev is None or not curr else round((prev / curr - 1) * 100, 1)
 
     # Accumulated Venta del mes / Compras reset each year, matching the per-year
-    # tables the other endpoints render; the variation carries across years.
+    # tables the other endpoints render.
+    lookup = thousands_by_period(rows)
     months = []
-    prev_sales = prev_compras = None
     for _year, year_rows in group_rows_by_year(rows):
         acc_sales = acc_compras = 0
         for r in year_rows:
             codes_k, sales_k, compras_k = row_in_thousands(r)
+            prev_sales, prev_compras = prior_year(lookup, r)
             acc_sales += sales_k
             acc_compras += compras_k
-            months.append({
-                "periodo": r["label"],
-                "year": r["year"],
-                "month": r["month"],
-                "folio": r.get("folio"),
-                "invoices": r.get("invoices"),
-                "codes": codes_k,
-                "venta_del_mes": sales_k,
-                "venta_acumulada": acc_sales,
-                "venta_variacion_pct": var_pct(prev_sales, sales_k),
-                "compras": compras_k,
-                "compras_acumulada": acc_compras,
-                "compras_variacion_pct": var_pct(prev_compras, compras_k),
-                "missing": r["missing"],
-                "missing_compras": r["missing_compras"],
-            })
-            prev_sales, prev_compras = sales_k, compras_k
+            months.append(
+                {
+                    "Mes": r["label"],
+                    "year": r["year"],
+                    "month": r["month"],
+                    "folio": r.get("folio"),
+                    "invoices": r.get("invoices"),
+                    "codes": codes_k,
+                    "venta_del_mes": sales_k,
+                    "venta_acumulada": acc_sales,
+                    "venta_variacion_pct": var_pct(prev_sales, sales_k),
+                    "compras": compras_k,
+                    "compras_acumulada": acc_compras,
+                    "compras_variacion_pct": var_pct(prev_compras, compras_k),
+                    "missing": r["missing"],
+                    "missing_compras": r["missing_compras"],
+                }
+            )
 
     return {
         "unit": "miles de pesos (codes rounded to nearest thousand before the "
@@ -239,7 +255,7 @@ async def extract(file: UploadFile = File(...)):
         "codes": FORMULA_CODES,
         "codes_compras": COMPRAS_CODES,
         "acumulado": "Venta/Compras acumuladas: suma mes a mes dentro de cada año.",
-        "variacion": "*_variacion_pct: (mes anterior / mes actual) - 1, en porcentaje.",
+        "variacion": "*_variacion_pct: (mismo mes año anterior / mes actual) - 1, en porcentaje.",
         "months": months,
     }
 
@@ -257,7 +273,7 @@ def _render_table(rows: list[dict], sep: str) -> list[str]:
         "Var. Compras",
     ]
     lines: list[str] = []
-    prev_sales = prev_compras = None
+    lookup = thousands_by_period(rows)
     for year, year_rows in group_rows_by_year(rows):
         lines += [
             f"## {year}",
@@ -269,6 +285,7 @@ def _render_table(rows: list[dict], sep: str) -> list[str]:
         agg = _YearAggregator()
         for r in year_rows:
             _, sales_k, compras_k = row_in_thousands(r)
+            prev_sales, prev_compras = prior_year(lookup, r)
             acc_sales += sales_k
             acc_compras += compras_k
             var_sales = format_variation(prev_sales, sales_k)
@@ -287,12 +304,16 @@ def _render_table(rows: list[dict], sep: str) -> list[str]:
             ]
             lines.append("| " + sep.join(row) + " |")
             agg.add(sales_k, compras_k, r.get("invoices"))
-            prev_sales, prev_compras = sales_k, compras_k
         a = agg.averages()
         avg_row = [
-            "**Promedio**", "—",
-            fmt(a.sales), "—", "—",
-            fmt(a.compras), "—", "—",
+            "**Promedio**",
+            "—",
+            fmt(a.sales),
+            "—",
+            "—",
+            fmt(a.compras),
+            "—",
+            "—",
         ]
         lines.append("| " + sep.join(avg_row) + " |")
         lines.append("")
@@ -304,7 +325,7 @@ async def extract_markdown(file: UploadFile = File(...)):
     """Return the monthly sales as a Markdown table (values in thousands)."""
     _, rows = pdf_to_rows(await file.read(), file.filename or "")
     body = [
-        "# Ventas por mes (Formulario 29) — miles de pesos",
+        "# Resumen de ventas y compras formulario 29 — miles de pesos",
         "",
         "Venta del mes: `020 + 142 + 538 / 0,19 + 587`  ·  "
         "Compras: `535 / 0,19 + 520 / 0,19 - 528 / 0,19 + 532 / 0,19 + 521 + 560 + 562`  ·  "
@@ -343,11 +364,22 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
     from fpdf import FPDF
 
     pdf = FPDF(orientation="L", unit="mm", format="A4")
-    pdf.set_title("Ventas por mes (Formulario 29)")
+    pdf.set_title("Resumen de ventas y compras formulario 29 (miles de pesos)")
+    # Quadrant positions are placed by hand, so keep fpdf from inserting its own
+    # page breaks mid-grid.
+    pdf.set_auto_page_break(False)
+    page_left = pdf.l_margin
     pdf.add_page()
 
     pdf.set_font("Helvetica", "B", 15)
-    pdf.cell(0, 10, "Ventas por mes (Formulario 29)", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(
+        0,
+        10,
+        "Resumen de ventas y compras formulario 29 (miles de pesos)",
+        new_x="LMARGIN",
+        new_y="NEXT",
+        align="C",
+    )
     pdf.set_font("Helvetica", "", 9)
     pdf.set_text_color(90, 90, 90)
     pdf.cell(
@@ -374,34 +406,38 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
         )
     pdf.ln(3)
 
-    # Column layout as (header, width_mm, align), driving both the header row
-    # and the data rows so they can never drift out of sync. Widths sum to
-    # 266mm, within landscape A4's ~277mm usable width.
+    # Compact per-year table (header, width_mm, align), sized so two sit side by
+    # side within landscape A4's ~277mm usable width. Widths sum to 128mm; the
+    # 2x2 grid places four of them per page.
     columns = [
-        ("Período", 28, "L"),
-        ("Folio", 34, "R"),
-        ("Venta del mes", 40, "R"),
-        ("Venta acumulada", 40, "R"),
-        ("Var. Venta", 22, "R"),
-        ("Compras", 40, "R"),
-        ("Compras acumulada", 40, "R"),
-        ("Var. Compras", 22, "R"),
+        ("Mes", 14, "L"),
+        ("Ventas", 22, "R"),
+        ("Ventas Acumulado", 24, "R"),
+        ("% Var Ventas Acum Año Anterior", 22, "R"),
+        ("Compras", 22, "R"),
+        ("Compras Acumulado", 24, "R"),
     ]
+    table_w = sum(w for _, w, _ in columns)  # 128mm
 
-    red = (198, 40, 40)  # matches the HTML deficit colour (#c62828)
+    orange = (230, 81, 0)  # matches the HTML deficit colour (#e65100)
+    ROW_H = 4.0           # data / total / average row height
+    HEAD_H = 10           # column-header row height (labels wrap onto 2-3 lines)
+    TITLE_H = 6           # per-year title height
 
-    def emit_row(cells, height, deficit=False):
-        """Draw one bordered row from `cells`, keeping every cell on one line.
+    def emit_row(cells, x0, deficit=False):
+        """Draw one bordered row from `cells` starting at x0, on one line.
 
-        When `deficit` is set, the value columns (index >= 2: Venta/Compras and
-        their derived columns) are printed in red; Período and Folio stay black.
+        When `deficit` is set, the value columns (every column except Mes) are
+        printed in orange; the Mes column stays black.
         """
+        pdf.set_left_margin(x0)
+        pdf.set_x(x0)
         for i, ((_, w, align), text) in enumerate(zip(columns, cells)):
             last = i == len(columns) - 1
-            pdf.set_text_color(*(red if deficit and i >= 2 else (0, 0, 0)))
+            pdf.set_text_color(*(orange if deficit and i >= 1 else (0, 0, 0)))
             pdf.cell(
                 w,
-                height,
+                ROW_H,
                 text,
                 border=1,
                 align=align,
@@ -410,90 +446,125 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
             )
         pdf.set_text_color(0, 0, 0)
 
-    def emit_header():
-        """Draw the shaded column-header row of a year's table."""
-        pdf.set_font("Helvetica", "B", 8)
+    def emit_header(x0):
+        """Draw the shaded column-header row at x0, wrapping long labels.
+
+        Each header is a filled, bordered box of fixed height HEAD_H with its
+        (possibly multi-line) label centred inside via multi_cell.
+        """
+        pdf.set_font("Helvetica", "B", 6)
         pdf.set_fill_color(244, 244, 245)
-        for i, (label, w, align) in enumerate(columns):
-            last = i == len(columns) - 1
-            pdf.cell(
-                w,
-                9,
-                label,
-                border=1,
-                align=align,
-                fill=True,
-                new_x="LMARGIN" if last else "RIGHT",
-                new_y="NEXT" if last else "TOP",
-            )
+        x, y = x0, pdf.get_y()
+        for label, w, _ in columns:
+            pdf.set_xy(x, y)
+            pdf.cell(w, HEAD_H, "", border=1, fill=True)
+            pdf.set_xy(x, y + 0.8)
+            pdf.multi_cell(w, 2.8, label, align="C")
+            x += w
+        pdf.set_left_margin(x0)
+        pdf.set_xy(x0, y + HEAD_H)
 
     # Core Helvetica is Latin-1, which excludes the em dash fmt()/format_variation
     # use for a missing value, so render numeric cells with a plain hyphen.
     def money(v):
-        return "-" if v is None else f"{v:,}"
+        return "-" if v is None else f"{v:,}".replace(",", ".")
 
     def pct(prev, curr):
         return format_variation(prev, curr).replace("—", "-")
 
     has_incomplete = False
-    prev_sales = prev_compras = None
-    for year, year_rows in group_rows_by_year(rows):
-        pdf.set_font("Helvetica", "B", 11)
-        pdf.cell(0, 8, str(year), new_x="LMARGIN", new_y="NEXT")
-        emit_header()
-        pdf.set_font("Helvetica", "", 8)
+    bottom_y = 0.0
+    lookup = thousands_by_period(rows)
+
+    def render_year(year, year_rows, x0, y0):
+        """Draw one year's compact table with its top-left corner at (x0, y0)."""
+        nonlocal has_incomplete, bottom_y
+        pdf.set_xy(x0, y0)
+        pdf.set_left_margin(x0)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(table_w, TITLE_H, str(year), new_x="LMARGIN", new_y="NEXT")
+        emit_header(x0)
+        pdf.set_font("Helvetica", "", 6)
         acc_sales = acc_compras = 0
         agg = _YearAggregator()
         for r in year_rows:
             _, sales_k, compras_k = row_in_thousands(r)
+            prev_sales, _ = prior_year(lookup, r)
             acc_sales += sales_k
             acc_compras += compras_k
+            # Monthly year-over-year variation (this month vs the same month a
+            # year earlier), shown in the "% Var Ventas Acum Año Anterior" column.
             var_sales = pct(prev_sales, sales_k)
-            var_compras = pct(prev_compras, compras_k)
             ventas = money(sales_k) + (" *" if r["missing"] else "")
             compras = money(compras_k) + (" *" if r["missing_compras"] else "")
             if r["missing"] or r["missing_compras"]:
                 has_incomplete = True
             cells = [
                 r["month_name"],
-                r.get("folio") or "-",
                 ventas,
                 money(acc_sales),
                 var_sales,
                 compras,
                 money(acc_compras),
-                var_compras,
             ]
-            # Red row when this month's accumulated Compras pass accumulated Venta.
-            emit_row(cells, 7, acc_compras > acc_sales)
+            # Orange row when this month's accumulated Compras pass accumulated Venta.
+            emit_row(cells, x0, acc_compras > acc_sales)
             agg.add(sales_k, compras_k, r.get("invoices"))
-            prev_sales, prev_compras = sales_k, compras_k
+        # Per-year Total row: the year's summed Ventas and Compras (acc_sales /
+        # acc_compras hold those sums after the month loop).
+        pdf.set_font("Helvetica", "B", 6)
+        emit_row(
+            ["Total", money(acc_sales), "-", "-", money(acc_compras), "-"],
+            x0,
+        )
         # Per-year Promedio row: total per invoice (code 503) for Venta del mes
         # and Compras; the other columns have no per-invoice meaning ("-").
         a = agg.averages()
-        pdf.set_font("Helvetica", "B", 8)
         emit_row(
-            [
-                "Promedio",
-                "-",
-                money(a.sales),
-                "-",
-                "-",
-                money(a.compras),
-                "-",
-                "-",
-            ],
-            7,
+            ["Promedio", money(a.sales), "-", "-", money(a.compras), "-"],
+            x0,
         )
-        pdf.set_font("Helvetica", "", 8)
-        pdf.ln(4)
+        pdf.set_font("Helvetica", "", 6)
+        bottom_y = max(bottom_y, pdf.get_y())
 
+    # 2x2 grid geometry: up to four years per page, filled left-to-right then
+    # top-to-bottom (first year top-left, last year bottom-right). More than four
+    # years spill onto additional pages, four at a time.
+    years = list(group_rows_by_year(rows))
+    col_gap = 8
+    x_left = page_left
+    x_right = page_left + table_w + col_gap
+    # A 12-month table is ~TITLE_H + HEAD_H + 14*ROW_H high (12 months + Total +
+    # Promedio); pitch the two rows so the bottom table clears the top one.
+    slot_pitch = TITLE_H + HEAD_H + 14 * ROW_H + 6
+
+    for start in range(0, len(years), 4):
+        group = years[start : start + 4]
+        if start == 0:
+            grid_top = pdf.get_y()
+        else:
+            pdf.add_page()
+            grid_top = pdf.t_margin
+        slots = [
+            (x_left, grid_top),
+            (x_right, grid_top),
+            (x_left, grid_top + slot_pitch),
+            (x_right, grid_top + slot_pitch),
+        ]
+        for (year, year_rows), (sx, sy) in zip(group, slots):
+            render_year(year, year_rows, sx, sy)
+
+    pdf.set_left_margin(page_left)
     if has_incomplete:
-        pdf.ln(3)
+        note_y = bottom_y + 4
+        if note_y > pdf.h - pdf.b_margin - 8:
+            pdf.add_page()
+            note_y = pdf.t_margin
+        pdf.set_xy(page_left, note_y)
         pdf.set_font("Helvetica", "", 8)
         pdf.set_text_color(90, 90, 90)
         pdf.multi_cell(
-            sum(w for _, w, _ in columns),
+            table_w * 2,
             5,
             "* Mes con codigos faltantes (contados como 0).",
         )
@@ -546,7 +617,7 @@ PAGE = """<!doctype html><html lang="es"><head><meta charset="utf-8">
 <style>
   body {{ font-family: system-ui, sans-serif; max-width: 60rem; margin: 2rem auto;
          padding: 0 1rem; color: #1a1a1a; }}
-  h1 {{ font-size: 1.4rem; }}
+  h1 {{ font-size: 1.4rem; text-align: center; }}
   h2 {{ font-size: 1.1rem; margin: 1.5rem 0 .5rem; }}
   form {{ margin: 1rem 0 2rem; }}
   table {{ border-collapse: collapse; width: 100%; margin-bottom: 1rem;
@@ -556,8 +627,8 @@ PAGE = """<!doctype html><html lang="es"><head><meta charset="utf-8">
   thead th {{ background: #f4f4f5; }}
   tr.avg td {{ background: #fafafa; font-weight: 600; border-top: 2px solid #ccc; }}
   td.num {{ font-feature-settings: "tnum"; }}
-  /* Month whose accumulated Compras exceed accumulated Venta: numbers in red. */
-  tr.deficit td.num {{ color: #c62828; }}
+  /* Month whose accumulated Compras exceed accumulated Venta: numbers in orange. */
+  tr.deficit td.num {{ color: #e65100; }}
   .note {{ color: #666; font-size: .85rem; }}
 </style></head><body>
 <h1>Extractor de ventas IVA / Formulario 29</h1>
@@ -591,19 +662,16 @@ def _html_table(rows: list[dict]) -> str:
         "Compras acumulada",
         "Var. Compras",
     ]
-    head = (
-        "<thead><tr>"
-        + "".join(f"<th>{h}</th>" for h in columns)
-        + "</tr></thead>"
-    )
+    head = "<thead><tr>" + "".join(f"<th>{h}</th>" for h in columns) + "</tr></thead>"
     sections = ""
-    prev_sales = prev_compras = None
+    lookup = thousands_by_period(rows)
     for year, year_rows in group_rows_by_year(rows):
         body = ""
         acc_sales = acc_compras = 0
         agg = _YearAggregator()
         for r in year_rows:
             _, sales_k, compras_k = row_in_thousands(r)
+            prev_sales, prev_compras = prior_year(lookup, r)
             acc_sales += sales_k
             acc_compras += compras_k
             var_sales = format_variation(prev_sales, sales_k)
@@ -623,7 +691,6 @@ def _html_table(rows: list[dict]) -> str:
                 f'<td class="num">{html.escape(var_compras)}</td></tr>'
             )
             agg.add(sales_k, compras_k, r.get("invoices"))
-            prev_sales, prev_compras = sales_k, compras_k
         a = agg.averages()
         body += (
             '<tr class="avg"><td>Promedio</td>'
@@ -635,9 +702,7 @@ def _html_table(rows: list[dict]) -> str:
             '<td class="num">—</td>'
             '<td class="num">—</td></tr>'
         )
-        sections += (
-            f"<h2>{year}</h2><table>{head}<tbody>{body}</tbody></table>"
-        )
+        sections += f"<h2>{year}</h2><table>{head}<tbody>{body}</tbody></table>"
     return sections
 
 
@@ -678,9 +743,7 @@ def _stored_rows(doc: dict) -> list[dict]:
                 "sales": r["sales"],
                 "compras": r["compras"],
                 "missing": [c for c in FORMULA_CODES if r["codes"][c] is None],
-                "missing_compras": [
-                    c for c in COMPRAS_CODES if r["codes"][c] is None
-                ],
+                "missing_compras": [c for c in COMPRAS_CODES if r["codes"][c] is None],
             }
         )
     return rows
