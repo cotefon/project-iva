@@ -53,8 +53,17 @@ TARGET_CODES = ALL_CODES + [INVOICE_CODE]
 RATE = 0.19
 
 SPANISH_MONTHS = {
-    1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
-    7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov",
+    1: "Ene",
+    2: "Feb",
+    3: "Mar",
+    4: "Abr",
+    5: "May",
+    6: "Jun",
+    7: "Jul",
+    8: "Ago",
+    9: "Sep",
+    10: "Oct",
+    11: "Nov",
     12: "Dic",
 }
 
@@ -217,14 +226,47 @@ def month_compras(values: dict) -> float:
     Missing codes = 0."""
     g = lambda c: values.get(c) or 0
     return (
-        g("535") / RATE + g("520") / RATE - g("528") / RATE + g("532") / RATE
-        + g("521") + g("560") + g("562")
+        g("535") / RATE
+        + g("520") / RATE
+        - g("528") / RATE
+        + g("532") / RATE
+        + g("521")
+        + g("560")
+        + g("562")
     )
 
 
 def format_int(n) -> str:
     """4425564773 -> '4.425.564.773' (Chilean thousands separators)."""
     return f"{int(round(n)):,}".replace(",", ".")
+
+
+def round_thousand(n):
+    """Round a peso amount to the nearest thousand, expressed in thousands:
+    1_807_028_373 -> 1_807_028.
+
+    None (a missing code) passes through unchanged.
+    """
+    return None if n is None else int(round(n / 1000))
+
+
+def row_in_thousands(row: dict):
+    """Everything-in-thousands view of a monthly row.
+
+    Codes are rounded to the nearest thousand *first*, then each formula is
+    applied to those rounded values and its result rounded to the nearest
+    thousand too. Missing codes stay None (the formulas count them as 0).
+
+    Every report — the CLI Markdown table and each API view — presents figures
+    in thousands, so this lives beside the formulas rather than in one caller,
+    keeping a single definition of the rounding both layers show.
+
+    Returns (codes_thousands: dict, sales_thousands: int, compras_thousands: int).
+    """
+    codes_k = {c: round_thousand(row["codes"][c]) for c in ALL_CODES}
+    sales_k = int(round(month_sales(codes_k)))
+    compras_k = int(round(month_compras(codes_k)))
+    return codes_k, sales_k, compras_k
 
 
 def variation_pct(prev, curr):
@@ -287,21 +329,21 @@ def monthly_rows(markdown: str) -> list[dict]:
     folios = folios_by_period(markdown)
     for (year, month), block in split_by_period(markdown):
         values = {c: first_value(block, c) for c in ALL_CODES}
-        rows.append({
-            "year": year,
-            "month": month,
-            "month_name": SPANISH_MONTHS.get(month, str(month)),
-            "label": f"{SPANISH_MONTHS.get(month, month)} {year}",
-            "folio": folios.get((year, month)),
-            "codes": values,
-            "invoices": first_value(block, INVOICE_CODE),
-            "sales": month_sales(values),
-            "compras": month_compras(values),
-            "missing": [c for c in FORMULA_CODES if values[c] is None],
-            "missing_compras": [
-                c for c in COMPRAS_CODES if values[c] is None
-            ],
-        })
+        rows.append(
+            {
+                "year": year,
+                "month": month,
+                "month_name": SPANISH_MONTHS.get(month, str(month)),
+                "label": f"{SPANISH_MONTHS.get(month, month)} {year}",
+                "folio": folios.get((year, month)),
+                "codes": values,
+                "invoices": first_value(block, INVOICE_CODE),
+                "sales": month_sales(values),
+                "compras": month_compras(values),
+                "missing": [c for c in FORMULA_CODES if values[c] is None],
+                "missing_compras": [c for c in COMPRAS_CODES if values[c] is None],
+            }
+        )
     return rows
 
 
@@ -314,12 +356,39 @@ def group_rows_by_year(rows: list[dict]) -> list[tuple[int, list[dict]]]:
     return [(year, list(g)) for year, g in groupby(rows, key=lambda r: r["year"])]
 
 
+def fill_year_months(year: int, year_rows: list[dict]) -> list[dict]:
+    """Return the year's twelve months in order, padding the ones not declared.
+
+    `year_rows` is one year's slice of monthly_rows(). A month with no F29
+    declaration in the document becomes a placeholder carrying only its identity
+    plus `blank: True`, so every year table spans Ene-Dic. Renderers print a dash
+    in each value column of a blank month rather than a computed zero — an
+    unfiled month must never read as a month that declared nothing.
+    """
+    by_month = {r["month"]: r for r in year_rows}
+    return [
+        by_month.get(
+            m,
+            {
+                "year": year,
+                "month": m,
+                "month_name": SPANISH_MONTHS[m],
+                "label": f"{SPANISH_MONTHS[m]} {year}",
+                "blank": True,
+            },
+        )
+        for m in range(1, 13)
+    ]
+
+
 def build_monthly_table(markdown: str) -> str:
     """Build the Markdown report: one small table per year, its months as rows."""
     header = [
         "Período",
         "Folio",
         "Venta del mes",
+        "Facturas Emitidas",
+        "Promedio de monto por factura",
         "Venta acumulada",
         "Var. Venta",
         "Compras",
@@ -327,10 +396,18 @@ def build_monthly_table(markdown: str) -> str:
         "Var. Compras",
     ]
     lines = [
-        "# Ventas por mes (Formulario 29)",
+        "# Ventas por mes (Formulario 29) — miles de pesos",
         "",
+        "Todos los montos van en **miles de pesos**: cada código se redondea al "
+        "millar antes de aplicar la fórmula y el resultado también.  ·  "
         "Venta del mes: `020 + 142 + 538 / 0,19 + 587`  ·  "
         "Compras: `535 / 0,19 + 520 / 0,19 - 528 / 0,19 + 532 / 0,19 + 521 + 560 + 562`  ·  "
+        "*Facturas Emitidas* = cantidad de facturas del mes (código 503, un "
+        "conteo — es lo único que no va en miles).  ·  "
+        "*Promedio de monto por factura* = Venta del mes / cantidad de facturas emitidas "
+        "(código 503) del mismo mes.  ·  "
+        "Cada año muestra sus doce meses; los meses sin declaración en el "
+        "documento van con — en todas sus columnas.  ·  "
         "Las columnas *acumuladas* suman mes a mes dentro de cada año.  ·  "
         "*Var.* = variación respecto al mismo mes del año anterior "
         "`(mismo mes año anterior / mes actual) - 1`.",
@@ -339,9 +416,15 @@ def build_monthly_table(markdown: str) -> str:
 
     incomplete = []
     all_rows = monthly_rows(markdown)
-    # Same month, previous year -> figure, for year-over-year variation.
-    sales_by_period = {(r["year"], r["month"]): r["sales"] for r in all_rows}
-    compras_by_period = {(r["year"], r["month"]): r["compras"] for r in all_rows}
+    # Same month, previous year -> figure, for year-over-year variation. Kept in
+    # thousands like everything the table prints, so the percentage is computed
+    # from exactly the figures shown.
+    sales_by_period = {}
+    compras_by_period = {}
+    for r in all_rows:
+        _, sales_k, compras_k = row_in_thousands(r)
+        sales_by_period[(r["year"], r["month"])] = sales_k
+        compras_by_period[(r["year"], r["month"])] = compras_k
     for year, year_rows in group_rows_by_year(all_rows):
         lines += [
             f"## {year}",
@@ -349,18 +432,29 @@ def build_monthly_table(markdown: str) -> str:
             "| " + " | ".join(header) + " |",
             "| " + " | ".join(["---"] * len(header)) + " |",
         ]
-        acc_sales = acc_compras = 0.0
-        tot_sales = tot_compras = 0.0
+        acc_sales = acc_compras = 0
+        tot_sales = tot_compras = 0
         tot_invoices = 0
-        for r in year_rows:
-            acc_sales += r["sales"]
-            acc_compras += r["compras"]
+        n_months = 0  # months actually declared, the divisor for monthly averages
+        for r in fill_year_months(year, year_rows):
+            # Month not declared in the document: dashes across the row, and it
+            # contributes nothing to the accumulators or the yearly totals.
+            if r.get("blank"):
+                lines.append(
+                    "| "
+                    + " | ".join([r["month_name"]] + ["—"] * (len(header) - 1))
+                    + " |"
+                )
+                continue
+            _, sales_k, compras_k = row_in_thousands(r)
+            acc_sales += sales_k
+            acc_compras += compras_k
             prev_sales = sales_by_period.get((r["year"] - 1, r["month"]))
             prev_compras = compras_by_period.get((r["year"] - 1, r["month"]))
-            var_sales = format_variation(prev_sales, r["sales"])
-            var_compras = format_variation(prev_compras, r["compras"])
-            sales = format_int(r["sales"])
-            compras = format_int(r["compras"])
+            var_sales = format_variation(prev_sales, sales_k)
+            var_compras = format_variation(prev_compras, compras_k)
+            sales = format_int(sales_k)
+            compras = format_int(compras_k)
             if r["missing"]:
                 sales += " *"
             if r["missing_compras"]:
@@ -368,10 +462,14 @@ def build_monthly_table(markdown: str) -> str:
             missing = r["missing"] + r["missing_compras"]
             if missing:
                 incomplete.append(f"{r['label']} (faltan: {', '.join(missing)})")
+            # Average value of one invoice this month: Venta del mes / código 503.
+            avg_invoice = per_invoice(sales_k, r["invoices"])
             row = [
                 r["month_name"],
                 r["folio"] or "—",
                 sales,
+                format_int(r["invoices"]) if r["invoices"] is not None else "—",
+                format_int(avg_invoice) if avg_invoice is not None else "—",
                 format_int(acc_sales),
                 var_sales,
                 compras,
@@ -379,17 +477,27 @@ def build_monthly_table(markdown: str) -> str:
                 var_compras,
             ]
             lines.append("| " + " | ".join(row) + " |")
-            tot_sales += r["sales"]
-            tot_compras += r["compras"]
+            tot_sales += sales_k
+            tot_compras += compras_k
             tot_invoices += r["invoices"] or 0
-        # Promedio row: yearly total per invoice (code 503) for Venta del mes and
-        # Compras; the remaining columns have no per-invoice meaning ("—").
-        avg_sales = per_invoice(tot_sales, tot_invoices)
-        avg_compras = per_invoice(tot_compras, tot_invoices)
+            n_months += 1
+        # Promedio row: every cell is the mean of its own column. Venta del mes,
+        # Facturas Emitidas and Compras average over the months actually declared
+        # — not over twelve — so a year with two declarations reports the mean of
+        # those two. Only the Promedio de monto por factura cell divides by the
+        # invoice count instead, matching what that column measures. Acumuladas
+        # and Var. have no meaningful mean ("—").
+        avg = lambda total: total / n_months if n_months else None
+        avg_sales = avg(tot_sales)
+        avg_compras = avg(tot_compras)
+        avg_invoices = avg(tot_invoices)
+        avg_per_factura = per_invoice(tot_sales, tot_invoices)
         avg_row = [
             "**Promedio**",
             "—",
             format_int(avg_sales) if avg_sales is not None else "—",
+            format_int(avg_invoices) if avg_invoices is not None else "—",
+            format_int(avg_per_factura) if avg_per_factura is not None else "—",
             "—",
             "—",
             format_int(avg_compras) if avg_compras is not None else "—",
@@ -487,9 +595,7 @@ def pdf_to_text_pypdf(pdf_path: str) -> str:
     from pypdf import PdfReader
 
     reader = PdfReader(pdf_path)
-    pages = [
-        page.extract_text(extraction_mode="layout") or "" for page in reader.pages
-    ]
+    pages = [page.extract_text(extraction_mode="layout") or "" for page in reader.pages]
     return "\n".join(pages)
 
 
