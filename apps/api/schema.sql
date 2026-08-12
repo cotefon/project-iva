@@ -61,8 +61,24 @@ alter table declaration
 alter table declaration add column if not exists folio text;
 alter table declaration add column if not exists invoices int;
 
+-- Ownership: which signed-in user uploaded this document. Matches auth.users.id
+-- (the `sub` claim of the Supabase access token; see auth.py). Nullable because
+-- documents extracted before login existed have no owner — those rows stay in
+-- the table but stop being visible, since every read now filters by user_id.
+alter table document add column if not exists user_id uuid;
+
+-- One row per signed-in user for the profile fields Supabase Auth does not
+-- store. Email and password live in auth.users and are changed through the
+-- Auth admin API (storage.update_auth_user), not here.
+create table if not exists profile (
+    id         uuid primary key,   -- matches auth.users.id
+    nombre     text,
+    updated_at timestamptz not null default now()
+);
+
 create index if not exists idx_declaration_period on declaration (year, month);
 create index if not exists idx_document_rut on document (rut);
+create index if not exists idx_document_user on document (user_id);
 
 -- Row Level Security: these tables are written server-side with the
 -- service_role key, which bypasses RLS. Enabling RLS with no policy therefore
@@ -70,3 +86,4 @@ create index if not exists idx_document_rut on document (rut);
 alter table taxpayer    enable row level security;
 alter table document    enable row level security;
 alter table declaration enable row level security;
+alter table profile     enable row level security;

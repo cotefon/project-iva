@@ -1,0 +1,20 @@
+{
+  "name": "project-iva",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Monorepo root: Turborepo task runner for the FastAPI backend and the React front end.",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "typecheck": "turbo run typecheck",
+    "api": "npm run dev --workspace iva-api",
+    "web": "npm run dev --workspace iva-web"
+  },
+  "devDependencies": {
+    "turbo": "^2.3.0"
+  },
+  "packageManager": "npm@10.9.8"
+}

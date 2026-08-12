@@ -4,26 +4,38 @@ Upload a Chilean tax PDF (Carpeta Tributaria) and get back a per-month table of
 the Formulario 29 sales figures. All amounts are rounded to the nearest thousand
 pesos: e.g. 1.000.000 is reported as 1.000.
 
-Endpoints:
-    GET  /            HTML upload form + results (browser-friendly).
-    POST /extract     JSON: {"unit": "miles de pesos", "months": [...]}.
-    POST /extract.md  Markdown table (text/markdown), values in thousands.
+Every endpoint requires a signed-in caller: the React app in `web/` authenticates
+against Supabase Auth and sends the access token as a bearer header, which
+`auth.current_user` verifies. Uploads are recorded against that user, and the
+history endpoints only ever return the caller's own documents.
+
+Endpoints (all authenticated):
+    GET   /me             the caller's profile: {"id", "email", "nombre"}.
+    PATCH /me             edit the profile (nombre) and credentials (email/password).
+    GET   /ruts           the RUTs this user has uploaded.
+    GET   /history/{rut}  the user's latest stored extraction for a RUT, as JSON.
+    POST  /extract        JSON: {"unit": "miles de pesos", "months": [...]}.
+    POST  /extract.md     Markdown table (text/markdown), values in thousands.
+    POST  /extract.pdf    the rendered PDF report.
 
 The extraction logic lives in `extract_codes.py`; this module only handles the
-HTTP layer, temp-file plumbing, and the round-to-thousand presentation.
+HTTP layer, temp-file plumbing, and the round-to-thousand presentation. The UI
+lives in `web/` — this module renders no HTML.
 """
 
 from __future__ import annotations
 
-import html
 import logging
 import os
 import tempfile
 from typing import NamedTuple
 
-from fastapi import FastAPI, File, HTTPException, Response, UploadFile
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel, Field
 
+from auth import User, current_user
 from extract_codes import (
     COMPRAS_CODES,
     FORMULA_CODES,
@@ -48,6 +60,30 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# The React app runs on its own origin (Vite's dev server by default), so the
+# browser needs CORS to call this API at all. Set ALLOWED_ORIGINS to a
+# comma-separated list for other environments.
+#
+# expose_headers is not optional here: without it the browser hides
+# Content-Disposition from JavaScript, and the download button in web/ would
+# lose the "ventas_por_mes.pdf" filename that /extract.pdf sets.
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+    ).split(",")
+    if o.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+)
+
 
 def thousands_by_period(rows: list[dict]) -> dict:
     """Map {(year, month): (sales_k, compras_k)} in thousands, for looking up the
@@ -62,6 +98,16 @@ def thousands_by_period(rows: list[dict]) -> dict:
 def prior_year(lookup: dict, row: dict):
     """(sales_k, compras_k) for the same month one year earlier, or (None, None)."""
     return lookup.get((row["year"] - 1, row["month"]), (None, None))
+
+
+def year_is_complete(year_rows: list[dict]) -> bool:
+    """True when the year has a declaration for all twelve months.
+
+    The deficit highlight (accumulated Compras above accumulated Venta) is only
+    meaningful on a full year: in a partial year the accumulated figures cover
+    different spans of months and would flag a gap in the document as a deficit.
+    """
+    return len({r["month"] for r in year_rows}) == 12
 
 
 def fmt(v) -> str:
@@ -138,7 +184,7 @@ class _YearAggregator:
 
 
 def pdf_to_rows(
-    data: bytes, filename: str, extract=pdf_to_text
+    data: bytes, filename: str, user_id: str, extract=pdf_to_text
 ) -> tuple[str, list[dict]]:
     """Convert uploaded PDF bytes to (extracted text, structured monthly rows).
 
@@ -148,6 +194,9 @@ def pdf_to_rows(
     for the faster backend). Both need a real path, so we stage the upload in a
     temp file that is always cleaned up. Rejects non-PDF uploads and empty
     results early.
+
+    `user_id` is recorded as the document's owner, so the history endpoints can
+    return this upload to its uploader and to nobody else.
     """
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a .pdf file.")
@@ -181,7 +230,7 @@ def pdf_to_rows(
     # is a record.
     try:
         doc_id = storage.save_extraction(
-            extract_taxpayer(text), rows, source_file=filename
+            extract_taxpayer(text), rows, source_file=filename, user_id=user_id
         )
         log.info("Persisted extraction as document %s (%s rows)", doc_id, len(rows))
     except Exception:
@@ -191,13 +240,13 @@ def pdf_to_rows(
 
 
 @app.get("/ruts")
-async def list_ruts():
-    """Return every RUT that has stored extractions, each with its name.
+async def list_ruts(user: User = Depends(current_user)):
+    """Return the RUTs this user has uploaded, each with its name.
 
     503 if persistence isn't configured (SUPABASE_URL / SUPABASE_KEY missing).
     """
     try:
-        taxpayers = storage.list_taxpayers()
+        taxpayers = storage.list_taxpayers(user.id)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     return {
@@ -207,10 +256,13 @@ async def list_ruts():
     }
 
 
-@app.post("/extract")
-async def extract(file: UploadFile = File(...)):
-    """Return the monthly sales as JSON, all amounts in thousands of pesos."""
-    _, rows = pdf_to_rows(await file.read(), file.filename or "")
+def _extract_payload(rows: list[dict]) -> dict:
+    """The JSON body for a set of monthly rows, all amounts in thousands.
+
+    Shared by /extract and /history/{rut} so a freshly uploaded document and a
+    stored one arrive in the same shape and the React table renders both without
+    branching.
+    """
 
     # (prev / curr - 1) * 100, or None when undefined (no matching month a year
     # earlier, or a current value of 0). Compared against the same month of the
@@ -265,16 +317,23 @@ async def extract(file: UploadFile = File(...)):
     }
 
 
+@app.post("/extract")
+async def extract(file: UploadFile = File(...), user: User = Depends(current_user)):
+    """Return the monthly sales as JSON, all amounts in thousands of pesos."""
+    _, rows = pdf_to_rows(await file.read(), file.filename or "", user.id)
+    return _extract_payload(rows)
+
+
 def _render_table(rows: list[dict], sep: str) -> list[str]:
     """Shared Markdown lines: one small table per year, its months as rows."""
     header = [
         "Período",
         "Folio",
         "Venta del mes",
-        "Facturas Emitidas",
-        "Promedio de monto por factura",
         "Venta acumulada",
         "Var. Venta",
+        "Facturas Emitidas",
+        "Promedio de monto por factura",
         "Compras",
         "Compras acumulada",
         "Var. Compras",
@@ -312,10 +371,10 @@ def _render_table(rows: list[dict], sep: str) -> list[str]:
                 r["month_name"],
                 r.get("folio") or "—",
                 sales,
-                fmt(r.get("invoices")),
-                fmt(avg_invoice(sales_k, r.get("invoices"))),
                 fmt(acc_sales),
                 var_sales,
+                fmt(r.get("invoices")),
+                fmt(avg_invoice(sales_k, r.get("invoices"))),
                 compras,
                 fmt(acc_compras),
                 var_compras,
@@ -327,10 +386,10 @@ def _render_table(rows: list[dict], sep: str) -> list[str]:
             "**Promedio**",
             "—",
             fmt(a.sales),
+            "—",
+            "—",
             fmt(a.invoices),
             fmt(a.per_factura),
-            "—",
-            "—",
             fmt(a.compras),
             "—",
             "—",
@@ -341,9 +400,11 @@ def _render_table(rows: list[dict], sep: str) -> list[str]:
 
 
 @app.post("/extract.md", response_class=PlainTextResponse)
-async def extract_markdown(file: UploadFile = File(...)):
+async def extract_markdown(
+    file: UploadFile = File(...), user: User = Depends(current_user)
+):
     """Return the monthly sales as a Markdown table (values in thousands)."""
-    _, rows = pdf_to_rows(await file.read(), file.filename or "")
+    _, rows = pdf_to_rows(await file.read(), file.filename or "", user.id)
     body = [
         "# Resumen de ventas y compras formulario 29 — miles de pesos",
         "",
@@ -434,10 +495,10 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
     columns = [
         ("Mes", 11, "L"),
         ("Ventas", 18, "R"),
-        ("Facturas Emitidas", 11, "R"),
-        ("Promedio de monto por factura", 17, "R"),
         ("Ventas Acumulado", 19, "R"),
         ("% Var Ventas Acum Año Anterior", 19, "R"),
+        ("Facturas Emitidas", 11, "R"),
+        ("Promedio de monto por factura", 17, "R"),
         ("Compras", 18, "R"),
         ("Compras Acumulado", 19, "R"),
     ]
@@ -448,17 +509,20 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
     HEAD_H = 10  # column-header row height (labels wrap onto 2-3 lines)
     TITLE_H = 6  # per-year title height
 
-    def emit_row(cells, x0, deficit=False):
+    COMPRAS_COL = 6  # index of "Compras" in `columns`
+
+    def emit_row(cells, x0, deficit_col=None):
         """Draw one bordered row from `cells` starting at x0, on one line.
 
-        When `deficit` is set, the value columns (every column except Mes) are
-        printed in orange; the Mes column stays black.
+        `deficit_col` is the index of the single cell to print in orange (the
+        Total row's Compras when the year's purchases pass its sales); every
+        other cell stays black.
         """
         pdf.set_left_margin(x0)
         pdf.set_x(x0)
         for i, ((_, w, align), text) in enumerate(zip(columns, cells)):
             last = i == len(columns) - 1
-            pdf.set_text_color(*(orange if deficit and i >= 1 else (0, 0, 0)))
+            pdf.set_text_color(*(orange if i == deficit_col else (0, 0, 0)))
             pdf.cell(
                 w,
                 ROW_H,
@@ -510,6 +574,7 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
         emit_header(x0)
         pdf.set_font("Helvetica", "", 6)
         acc_sales = acc_compras = 0
+        complete = year_is_complete(year_rows)
         agg = _YearAggregator()
         for r in fill_year_months(year, year_rows):
             # Month not declared in the document: dashes across the row, and it
@@ -531,32 +596,37 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
             cells = [
                 r["month_name"],
                 ventas,
-                money(r.get("invoices")),
-                money(avg_invoice(sales_k, r.get("invoices"))),
                 money(acc_sales),
                 var_sales,
+                money(r.get("invoices")),
+                money(avg_invoice(sales_k, r.get("invoices"))),
                 compras,
                 money(acc_compras),
             ]
-            # Orange row when this month's accumulated Compras pass accumulated Venta.
-            emit_row(cells, x0, acc_compras > acc_sales)
+            emit_row(cells, x0)
             agg.add(sales_k, compras_k, r.get("invoices"))
         # Per-year Total row: the year's summed Ventas and Compras (acc_sales /
         # acc_compras hold those sums after the month loop) plus its summed
         # Facturas Emitidas — a count, so summing is its natural aggregate.
+        #
+        # Its Compras cell turns orange when the year bought more than it sold,
+        # and only on a year with all twelve months declared: in a partial year
+        # the two totals cover different spans of months, so a gap in the
+        # document would read as a deficit.
         pdf.set_font("Helvetica", "B", 6)
         emit_row(
             [
                 "Total",
                 money(acc_sales),
+                "-",
+                "-",
                 money(agg.tot_invoices or None),
-                "-",
-                "-",
                 "-",
                 money(acc_compras),
                 "-",
             ],
             x0,
+            COMPRAS_COL if complete and acc_compras > acc_sales else None,
         )
         # Per-year Promedio row: each cell is the mean of its own column over the
         # months actually declared, except Promedio de monto por factura, which
@@ -567,10 +637,10 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
             [
                 "Promedio",
                 money(a.sales),
+                "-",
+                "-",
                 money(a.invoices),
                 money(a.per_factura),
-                "-",
-                "-",
                 money(a.compras),
                 "-",
             ],
@@ -626,9 +696,9 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
 
 
 @app.post("/extract.pdf")
-async def extract_pdf(file: UploadFile = File(...)):
+async def extract_pdf(file: UploadFile = File(...), user: User = Depends(current_user)):
     """Return a PDF with the full monthly table (all codes + totals, thousands)."""
-    text, rows = pdf_to_rows(await file.read(), file.filename or "")
+    text, rows = pdf_to_rows(await file.read(), file.filename or "", user.id)
     taxpayer = extract_taxpayer(text)
     return Response(
         content=build_pdf(rows, taxpayer),
@@ -638,7 +708,9 @@ async def extract_pdf(file: UploadFile = File(...)):
 
 
 @app.post("/extract-fast.pdf")
-async def extract_pdf_fast(file: UploadFile = File(...)):
+async def extract_pdf_fast(
+    file: UploadFile = File(...), user: User = Depends(current_user)
+):
     """Same PDF as /extract.pdf but read with the faster pypdf backend.
 
     Identical output; only the source-PDF text extraction differs (pypdf instead
@@ -647,7 +719,7 @@ async def extract_pdf_fast(file: UploadFile = File(...)):
     documents before switching the default backend.
     """
     text, rows = pdf_to_rows(
-        await file.read(), file.filename or "", extract=pdf_to_text_pypdf
+        await file.read(), file.filename or "", user.id, extract=pdf_to_text_pypdf
     )
     taxpayer = extract_taxpayer(text)
     return Response(
@@ -655,144 +727,6 @@ async def extract_pdf_fast(file: UploadFile = File(...)):
         media_type="application/pdf",
         headers={"Content-Disposition": 'attachment; filename="ventas_por_mes.pdf"'},
     )
-
-
-UPLOAD_FORM = """
-<form action="/" method="post" enctype="multipart/form-data">
-  <input type="file" name="file" accept="application/pdf" required>
-  <button type="submit">Extraer ventas</button>
-</form>
-"""
-
-PAGE = """<!doctype html><html lang="es"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Extractor IVA / F29</title>
-<style>
-  body {{ font-family: system-ui, sans-serif; max-width: 60rem; margin: 2rem auto;
-         padding: 0 1rem; color: #1a1a1a; }}
-  h1 {{ font-size: 1.4rem; text-align: center; }}
-  h2 {{ font-size: 1.1rem; margin: 1.5rem 0 .5rem; }}
-  form {{ margin: 1rem 0 2rem; }}
-  table {{ border-collapse: collapse; width: 100%; margin-bottom: 1rem;
-          font-variant-numeric: tabular-nums; }}
-  th, td {{ border: 1px solid #ddd; padding: .35rem .6rem; text-align: right; }}
-  th:first-child, td:first-child {{ text-align: left; }}
-  thead th {{ background: #f4f4f5; }}
-  tr.avg td {{ background: #fafafa; font-weight: 600; border-top: 2px solid #ccc; }}
-  td.num {{ font-feature-settings: "tnum"; }}
-  /* Month whose accumulated Compras exceed accumulated Venta: numbers in orange. */
-  tr.deficit td.num {{ color: #e65100; }}
-  /* Month with no declaration in the document: dashes, dimmed. */
-  tr.blank td {{ color: #aaa; }}
-  .note {{ color: #666; font-size: .85rem; }}
-</style></head><body>
-<h1>Extractor de ventas IVA / Formulario 29</h1>
-<p class="note">Sube una carpeta tributaria en PDF. Todos los montos se muestran
-en <strong>miles de pesos</strong>: los códigos se redondean al millar antes
-de aplicar la fórmula, y la Venta del mes también se redondea al millar.</p>
-{form}
-{results}
-</body></html>"""
-
-
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    """Upload form."""
-    return PAGE.format(form=UPLOAD_FORM, results="")
-
-
-def _html_table(rows: list[dict]) -> str:
-    """Render monthly rows as an HTML table (values in thousands).
-
-    Shared by the upload view and the history view so both look identical. Rows
-    must carry `label`, `codes`, `sales`, `missing` (monthly_rows() shape).
-    """
-    columns = [
-        "Período",
-        "Folio",
-        "Venta del mes",
-        "Facturas Emitidas",
-        "Promedio de monto por factura",
-        "Venta acumulada",
-        "Var. Venta",
-        "Compras",
-        "Compras acumulada",
-        "Var. Compras",
-    ]
-    head = "<thead><tr>" + "".join(f"<th>{h}</th>" for h in columns) + "</tr></thead>"
-    sections = ""
-    lookup = thousands_by_period(rows)
-    for year, year_rows in group_rows_by_year(rows):
-        body = ""
-        acc_sales = acc_compras = 0
-        agg = _YearAggregator()
-        for r in fill_year_months(year, year_rows):
-            # Month not declared in the document: dashes across the row, and it
-            # contributes nothing to the accumulators or the yearly totals.
-            if r.get("blank"):
-                body += (
-                    f'<tr class="blank"><td>{html.escape(r["month_name"])}</td>'
-                    + '<td class="num">—</td>' * (len(columns) - 1)
-                    + "</tr>"
-                )
-                continue
-            _, sales_k, compras_k = row_in_thousands(r)
-            prev_sales, prev_compras = prior_year(lookup, r)
-            acc_sales += sales_k
-            acc_compras += compras_k
-            var_sales = format_variation(prev_sales, sales_k)
-            var_compras = format_variation(prev_compras, compras_k)
-            sales = fmt(sales_k) + (" *" if r["missing"] else "")
-            compras = fmt(compras_k) + (" *" if r["missing_compras"] else "")
-            # Red row when this month's accumulated Compras pass accumulated Venta.
-            tr = '<tr class="deficit">' if acc_compras > acc_sales else "<tr>"
-            body += (
-                f'{tr}<td>{html.escape(r["month_name"])}</td>'
-                f'<td class="num">{html.escape(r.get("folio") or "—")}</td>'
-                f'<td class="num">{sales}</td>'
-                f'<td class="num">{fmt(r.get("invoices"))}</td>'
-                f'<td class="num">{fmt(avg_invoice(sales_k, r.get("invoices")))}</td>'
-                f'<td class="num">{fmt(acc_sales)}</td>'
-                f'<td class="num">{html.escape(var_sales)}</td>'
-                f'<td class="num">{compras}</td>'
-                f'<td class="num">{fmt(acc_compras)}</td>'
-                f'<td class="num">{html.escape(var_compras)}</td></tr>'
-            )
-            agg.add(sales_k, compras_k, r.get("invoices"))
-        a = agg.averages()
-        body += (
-            '<tr class="avg"><td>Promedio</td>'
-            '<td class="num">—</td>'
-            f'<td class="num">{fmt(a.sales)}</td>'
-            f'<td class="num">{fmt(a.invoices)}</td>'
-            f'<td class="num">{fmt(a.per_factura)}</td>'
-            '<td class="num">—</td>'
-            '<td class="num">—</td>'
-            f'<td class="num">{fmt(a.compras)}</td>'
-            '<td class="num">—</td>'
-            '<td class="num">—</td></tr>'
-        )
-        sections += f"<h2>{year}</h2><table>{head}<tbody>{body}</tbody></table>"
-    return sections
-
-
-_FORMULA_NOTE = (
-    '<p class="note">Venta del mes: <code>020 + 142 + 538 / 0,19 + 587</code>. '
-    "Compras: "
-    "<code>535 / 0,19 + 520 / 0,19 - 528 / 0,19 + 532 / 0,19 + 521 + 560 + 562</code>. "
-    "Facturas Emitidas: cantidad de facturas del mes (<code>503</code>), un conteo "
-    "sin redondeo. Promedio de monto por factura: Venta del mes / Facturas "
-    "Emitidas del mismo mes. "
-    "Montos en miles de pesos (códigos redondeados al millar antes de cada "
-    "fórmula). * = mes con códigos faltantes (contados como 0).</p>"
-)
-
-
-@app.post("/", response_class=HTMLResponse)
-async def home_submit(file: UploadFile = File(...)):
-    """Handle the browser form upload and render the results as an HTML table."""
-    _, rows = pdf_to_rows(await file.read(), file.filename or "")
-    return PAGE.format(form=UPLOAD_FORM, results=_FORMULA_NOTE + _html_table(rows))
 
 
 def _stored_rows(doc: dict) -> list[dict]:
@@ -822,15 +756,20 @@ def _stored_rows(doc: dict) -> list[dict]:
     return rows
 
 
-@app.get("/history/{rut}", response_class=HTMLResponse)
-async def history(rut: str):
-    """Render the most recent stored extraction for a RUT as an HTML table.
+@app.get("/history/{rut}")
+async def history(rut: str, user: User = Depends(current_user)):
+    """The caller's most recent stored extraction for a RUT, in /extract's shape.
 
-    404 if nothing is stored for that RUT; 503 if persistence isn't configured
-    (SUPABASE_URL / SUPABASE_KEY missing), so the reason is explicit.
+    Same body as /extract plus the document's provenance, so the frontend renders
+    a stored document with the same table component as a fresh upload.
+
+    404 if this user has nothing stored for that RUT — including when another
+    user has uploaded it, since one user's documents are never readable by
+    another. 503 if persistence isn't configured (SUPABASE_URL / SUPABASE_KEY
+    missing), so the reason is explicit.
     """
     try:
-        doc = storage.latest_document(rut)
+        doc = storage.latest_document(rut, user.id)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     if doc is None:
@@ -838,18 +777,77 @@ async def history(rut: str):
             status_code=404, detail=f"Sin extracciones guardadas para el RUT {rut}."
         )
 
-    header = (
-        '<p class="note">Última extracción guardada · <strong>'
-        + html.escape(doc["nombre"] or "—")
-        + "</strong> (RUT "
-        + html.escape(doc["rut"])
-        + ") · archivo: "
-        + html.escape(doc["source_file"] or "—")
-        + " · "
-        + html.escape(str(doc["extracted_at"]))
-        + "</p>"
-    )
-    return PAGE.format(
-        form=UPLOAD_FORM,
-        results=header + _FORMULA_NOTE + _html_table(_stored_rows(doc)),
-    )
+    return {
+        "taxpayer": {"nombre": doc["nombre"], "rut": doc["rut"]},
+        "document_id": doc["document_id"],
+        "source_file": doc["source_file"],
+        "extracted_at": doc["extracted_at"],
+        **_extract_payload(_stored_rows(doc)),
+    }
+
+
+class ProfileUpdate(BaseModel):
+    """The editable fields of a user account. Every field is optional: the client
+    sends only what changed, and an omitted field is left alone.
+
+    `nombre` lands in our `profile` table; `email` and `password` belong to
+    Supabase Auth and go through the admin API. The minimum password length
+    mirrors Supabase's own default so an obviously-too-short password is
+    rejected here with a clear message instead of as an opaque upstream error.
+    """
+
+    nombre: str | None = None
+    email: str | None = None
+    password: str | None = Field(default=None, min_length=6)
+
+
+@app.get("/me")
+async def read_me(user: User = Depends(current_user)):
+    """The caller's profile. `nombre` is null until they save one."""
+    try:
+        profile = storage.get_profile(user.id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return {
+        "id": user.id,
+        "email": user.email,
+        "nombre": (profile or {}).get("nombre"),
+    }
+
+
+@app.patch("/me")
+async def update_me(changes: ProfileUpdate, user: User = Depends(current_user)):
+    """Edit the caller's own profile and credentials.
+
+    A user can only ever edit themselves: the id comes from the verified token,
+    never from the request body, so there is no id to tamper with.
+
+    Changing the email does not take effect immediately — Supabase sends a
+    confirmation mail to the new address first — so the response flags that and
+    the UI can say so rather than appearing to have silently failed.
+    """
+    credentials = {
+        k: v
+        for k, v in (("email", changes.email), ("password", changes.password))
+        if v
+    }
+    try:
+        if credentials:
+            storage.update_auth_user(user.id, **credentials)
+        if changes.nombre is not None:
+            storage.upsert_profile(user.id, changes.nombre.strip() or None)
+        profile = storage.get_profile(user.id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        # A rejected email or password is the user's problem to fix, not a
+        # server fault: report it as a 400 with the reason Supabase gave.
+        log.warning("Rechazado el cambio de credenciales de %s: %s", user.id, exc)
+        raise HTTPException(status_code=400, detail=f"No se pudo guardar: {exc}")
+
+    return {
+        "id": user.id,
+        "email": user.email,
+        "nombre": (profile or {}).get("nombre"),
+        "email_confirmation_pending": bool(changes.email),
+    }

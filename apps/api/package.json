@@ -1,0 +1,10 @@
+{
+  "name": "iva-api",
+  "private": true,
+  "version": "0.1.0",
+  "description": "FastAPI service. The scripts delegate to scripts/run-api.mjs so Turborepo can start it alongside the web app.",
+  "scripts": {
+    "dev": "node ../../scripts/run-api.mjs --reload",
+    "start": "node ../../scripts/run-api.mjs"
+  }
+}

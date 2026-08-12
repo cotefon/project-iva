@@ -1,7 +1,8 @@
 # project-iva
 
 Extract monthly sales figures from Chilean tax PDFs (Carpeta Tributaria /
-Formulario 29 / IVA declarations) and serve them as a table over HTTP.
+Formulario 29 / IVA declarations) and serve them as a table over HTTP, behind a
+React web app with per-user accounts.
 
 Upload a tax PDF and get back one row per month with the F29 sales figure. All
 amounts are reported in **thousands of pesos** with comma separators: each code
@@ -13,9 +14,13 @@ result is rounded to the nearest thousand too (so `1,807,028,373` appears as
 
 | File               | Role                                                                                                             |
 | ------------------ | ---------------------------------------------------------------------------------------------------------------- |
-| `api.py`           | FastAPI service — upload a PDF, get the monthly table (HTML / JSON / Markdown / PDF).                            |
-| `extract_codes.py` | Extraction pipeline: PDF → text (pdfplumber) → F29 code values → monthly table. Importable and CLI-runnable. |
-| `asd.py`           | Legacy first-draft script (superseded by `extract_codes.py`).                                                    |
+| `apps/web/`        | React + TypeScript front end: login, drag-and-drop extraction, profile editing.                                  |
+| `turbo.json`       | Turborepo tasks (`dev`, `build`, `typecheck`) across the front end and the API.                                  |
+
+| `apps/api/api.py`  | FastAPI service — upload a PDF, get the monthly table (JSON / Markdown / PDF). Authenticated; renders no HTML.   |
+| `apps/api/auth.py` | Verifies the Supabase access token on every request.                                                             |
+| `apps/api/storage.py` | Supabase persistence: extractions (per user) and profiles.                                                       |
+| `apps/api/extract_codes.py` | Extraction pipeline: PDF → text (pdfplumber) → F29 code values → monthly table. Importable and CLI-runnable. |
 
 The sales formula is `020 + 142 + 538 / 0,19 + 587`, applied per monthly
 declaration (delimited by the `PERIODO` field). Missing codes count as 0.
@@ -23,53 +28,104 @@ declaration (delimited by the `PERIODO` field). Missing codes count as 0.
 ## Setup
 
 ```bash
-python3 -m pip install -r requirements.txt
+python3 -m pip install -r apps/api/requirements.txt
 ```
 
 Pins `pdfplumber`, `fpdf2`, `python-dotenv`, `fastapi`, `uvicorn`,
-`python-multipart`. All are pure-Python or ship prebuilt wheels, so this installs
-cleanly on current Python versions.
+`python-multipart`, `supabase` and `PyJWT[crypto]`. All are pure-Python or ship
+prebuilt wheels, so this installs cleanly on current Python versions.
 
-## Run the API
+Then create the database objects: run `apps/api/schema.sql` in the Supabase SQL editor
+(Dashboard → SQL → New query). It is idempotent, so re-running it is safe.
+
+Front end and task runner (Turborepo drives both halves from the repo root):
 
 ```bash
-uvicorn api:app --reload
+npm install                            # installs the web/ workspace too
+cp apps/web/.env.example apps/web/.env.local     # Supabase URL + anon key, and the API URL
 ```
 
-Then either open <http://127.0.0.1:8000/> in a browser and upload a PDF, or:
+## Run everything
 
 ```bash
+npm run dev
+```
+
+Starts the API on <http://127.0.0.1:8000> and the web app on
+<http://localhost:5173> in one terminal. `npm run api` and `npm run web` start
+just one half; `npm run build` and `npm run typecheck` cover the front end.
+
+`scripts/run-api.mjs` finds the Python interpreter that actually has uvicorn
+installed (handy on mixed WSL/Windows setups). Override it with `PYTHON=...`.
+
+## Run the API on its own
+
+```bash
+cd apps/api && uvicorn api:app --reload    # or, from the root: npm run api
+```
+
+Every endpoint requires a signed-in caller, so `curl` needs a bearer token —
+copy one from the browser devtools after logging in to the web app:
+
+```bash
+TOKEN=...   # Supabase access_token
+
 # JSON (amounts in thousands of pesos)
-curl -F file=@"docs/CARPETA TRIBUTARIA FRUTAM.pdf" http://127.0.0.1:8000/extract
+curl -H "Authorization: Bearer $TOKEN" \
+     -F file=@"docs/CARPETA TRIBUTARIA FRUTAM.pdf" http://127.0.0.1:8000/extract
 
 # Markdown table
-curl -F file=@"docs/CARPETA TRIBUTARIA FRUTAM.pdf" http://127.0.0.1:8000/extract.md
+curl -H "Authorization: Bearer $TOKEN" \
+     -F file=@"docs/CARPETA TRIBUTARIA FRUTAM.pdf" http://127.0.0.1:8000/extract.md
 
 # PDF (Nombre / Razón Social + RUT header, then a Período | Ventas table)
-curl -F file=@"docs/CARPETA TRIBUTARIA FRUTAM.pdf" http://127.0.0.1:8000/extract.pdf -o ventas_por_mes.pdf
+curl -H "Authorization: Bearer $TOKEN" \
+     -F file=@"docs/CARPETA TRIBUTARIA FRUTAM.pdf" http://127.0.0.1:8000/extract.pdf -o ventas_por_mes.pdf
 ```
 
 Interactive API docs are at <http://127.0.0.1:8000/docs>.
 
+## Run the web app on its own
+
+With the API running:
+
+```bash
+cd apps/web && npm run dev        # or, from the root: npm run web
+```
+
+Sign up, then drag a tax PDF onto the drop zone: the monthly tables render on
+screen and *Descargar PDF* produces the same report `/extract.pdf` returns.
+Uploads are recorded against your account — one user never sees another's
+documents.
+
 ### Endpoints
 
-| Method | Path          | Returns                                             |
-| ------ | ------------- | --------------------------------------------------- |
-| `GET`  | `/`           | HTML upload form + rendered results table           |
-| `POST` | `/`           | HTML results table (browser form submit)            |
-| `POST` | `/extract`    | JSON: `{"unit": "miles de pesos", "months": [...]}` |
-| `POST` | `/extract.md` | Markdown table (`text/markdown`)                    |
-| `POST` | `/extract.pdf`| PDF download: taxpayer header (Nombre/Razón Social + RUT) + Período\|Ventas table |
+All endpoints require `Authorization: Bearer <supabase access token>`.
+
+| Method  | Path             | Returns                                             |
+| ------- | ---------------- | --------------------------------------------------- |
+| `GET`   | `/me`            | The caller's profile: `{"id", "email", "nombre"}`   |
+| `PATCH` | `/me`            | Edit name, email or password                        |
+| `GET`   | `/ruts`          | RUTs this user has uploaded                         |
+| `GET`   | `/history/{rut}` | The user's latest stored extraction for a RUT (JSON) |
+| `POST`  | `/extract`       | JSON: `{"unit": "miles de pesos", "months": [...]}` |
+| `POST`  | `/extract.md`    | Markdown table (`text/markdown`)                    |
+| `POST`  | `/extract.pdf`   | PDF download: taxpayer header (Nombre/Razón Social + RUT) + Período\|Ventas table |
 
 ## Run the extractor as a CLI (peso-level, not rounded)
 
 ```bash
-python3 extract_codes.py <file.pdf>      # or set PDF_FILE in .env
+python3 apps/api/extract_codes.py <file.pdf>      # or set PDF_FILE in .env
 ```
 
-Writes `output.md` (the intermediate extracted text) and `ventas_por_mes.md`
-(the report, in full pesos).
+Writes `outputs/output.md` (the intermediate extracted text) and
+`outputs/ventas_por_mes.md` (the report, in full pesos).
 
 ## Configuration
 
-- `.env` (gitignored) holds `PDF_FILE`, the default PDF path for the CLI.
+- `.env` (gitignored): `PDF_FILE` (default PDF path for the CLI), `SUPABASE_URL`,
+  `SUPABASE_KEY` (service_role — server-side only). Optional: `ALLOWED_ORIGINS`
+  for CORS, `SUPABASE_JWT_SECRET` for legacy HS256 projects.
+- `web/.env.local` (gitignored, template in `web/.env.example`):
+  `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, `VITE_API_URL`. Anon key only —
+  everything here ships to the browser.

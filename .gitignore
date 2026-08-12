@@ -14,8 +14,10 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Anchored to the repo root: unanchored "lib/" also matched apps/web/src/lib/,
+# silently keeping the front end's api/format/table modules out of the commit.
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -156,6 +158,21 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Frontend (web/). `.env` above does not cover Vite's `.env.local`, which holds
+# the Supabase anon key and the API URL for a given machine; `.env.example` is
+# the committed template. `dist/` is already ignored further up.
+node_modules/
+.env.local
+.env.*.local
+*.tsbuildinfo
+.vite/
+
+# Turborepo task cache and logs
+.turbo/
+
+# CLI output: extract_codes.py regenerates output.md / ventas_por_mes.md here.
+outputs/
 
 # Spyder project settings
 .spyderproject

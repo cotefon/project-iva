@@ -1,0 +1,233 @@
+/* Carries over the look of the server-rendered page this app replaces (the old
+   PAGE stylesheet in api.py): tabular numerals, the same table borders, the same
+   orange deficit colour. */
+
+:root {
+  --text: #1a1a1a;
+  --muted: #666;
+  --line: #ddd;
+  --shade: #f4f4f5;
+  --soft: #fafafa;
+  --accent: #1d4ed8;
+  --danger: #b91c1c;
+  --deficit: #e65100;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: system-ui, sans-serif;
+  color: var(--text);
+  margin: 0;
+  background: #fff;
+}
+
+.page {
+  max-width: 72rem;
+  margin: 0 auto;
+  padding: 1.5rem 1rem 4rem;
+}
+
+h1 {
+  font-size: 1.4rem;
+}
+h2 {
+  font-size: 1.1rem;
+  margin: 1.5rem 0 0.5rem;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.centered {
+  text-align: center;
+}
+
+/* ---- top bar ---- */
+
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--line);
+}
+.nav .brand {
+  font-weight: 600;
+}
+.nav .spacer {
+  flex: 1;
+}
+.nav a {
+  color: var(--text);
+  text-decoration: none;
+  padding: 0.25rem 0;
+  border-bottom: 2px solid transparent;
+}
+.nav a.active {
+  border-bottom-color: var(--accent);
+}
+
+/* ---- forms ---- */
+
+.card {
+  max-width: 26rem;
+  margin: 3rem auto;
+  padding: 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.field {
+  display: block;
+  margin-bottom: 0.9rem;
+}
+.field span {
+  display: block;
+  font-size: 0.85rem;
+  margin-bottom: 0.25rem;
+}
+input {
+  width: 100%;
+  padding: 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font: inherit;
+}
+button {
+  font: inherit;
+  padding: 0.5rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--shade);
+  cursor: pointer;
+}
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+button.link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  padding: 0;
+  text-decoration: underline;
+}
+
+.error {
+  color: var(--danger);
+  font-size: 0.9rem;
+  margin: 0.5rem 0;
+}
+.ok {
+  color: #15803d;
+  font-size: 0.9rem;
+  margin: 0.5rem 0;
+}
+
+/* ---- dropzone ---- */
+
+.dropzone {
+  border: 2px dashed var(--line);
+  border-radius: 10px;
+  padding: 2.5rem 1rem;
+  text-align: center;
+  color: var(--muted);
+  cursor: pointer;
+  background: #fff;
+  width: 100%;
+  font: inherit;
+}
+.dropzone.over {
+  border-color: var(--accent);
+  background: #eff6ff;
+  color: var(--text);
+}
+.dropzone:disabled {
+  cursor: wait;
+}
+
+/* ---- results ---- */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 1rem 0;
+  flex-wrap: wrap;
+}
+
+/* The ten-column year tables don't fit the 72rem reading column, so each one
+   breaks out of it and spans the window (up to 96rem), staying centred. The
+   heading rides along, keeping its left edge on the table's. On a narrow window
+   the min() collapses to the page width and this is a no-op; .table-scroll is
+   the fallback for anything still too wide. */
+.year {
+  width: min(96rem, calc(100vw - 2.5rem));
+  margin-left: calc(50% - min(96rem, 100vw - 2.5rem) / 2);
+}
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin-bottom: 1rem;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.9rem;
+}
+th,
+td {
+  border: 1px solid var(--line);
+  padding: 0.35rem 0.5rem;
+  text-align: right;
+  white-space: nowrap;
+}
+th:first-child,
+td:first-child {
+  text-align: left;
+}
+/* Headers wrap onto two or three lines (as in the PDF): a single-line
+   "Promedio de monto por factura" is wider than any figure under it and alone
+   pushed the table past the window. Numbers stay nowrap. */
+thead th {
+  background: var(--shade);
+  font-size: 0.8rem;
+  white-space: normal;
+  line-height: 1.15;
+  vertical-align: bottom;
+}
+tr.total td {
+  background: var(--soft);
+  font-weight: 600;
+  border-top: 2px solid #ccc;
+}
+tr.avg td {
+  background: var(--soft);
+  font-weight: 600;
+}
+/* Total Compras above Total Ventas on a full year: that cell alone in orange. */
+td.deficit {
+  color: var(--deficit);
+}
+/* Month with no declaration in the document: dashes, dimmed. */
+tr.blank td {
+  color: #aaa;
+}
+
+.history-list {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}

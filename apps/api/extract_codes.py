@@ -387,10 +387,10 @@ def build_monthly_table(markdown: str) -> str:
         "Período",
         "Folio",
         "Venta del mes",
-        "Facturas Emitidas",
-        "Promedio de monto por factura",
         "Venta acumulada",
         "Var. Venta",
+        "Facturas Emitidas",
+        "Promedio de monto por factura",
         "Compras",
         "Compras acumulada",
         "Var. Compras",
@@ -468,10 +468,10 @@ def build_monthly_table(markdown: str) -> str:
                 r["month_name"],
                 r["folio"] or "—",
                 sales,
-                format_int(r["invoices"]) if r["invoices"] is not None else "—",
-                format_int(avg_invoice) if avg_invoice is not None else "—",
                 format_int(acc_sales),
                 var_sales,
+                format_int(r["invoices"]) if r["invoices"] is not None else "—",
+                format_int(avg_invoice) if avg_invoice is not None else "—",
                 compras,
                 format_int(acc_compras),
                 var_compras,
@@ -496,10 +496,10 @@ def build_monthly_table(markdown: str) -> str:
             "**Promedio**",
             "—",
             format_int(avg_sales) if avg_sales is not None else "—",
+            "—",
+            "—",
             format_int(avg_invoices) if avg_invoices is not None else "—",
             format_int(avg_per_factura) if avg_per_factura is not None else "—",
-            "—",
-            "—",
             format_int(avg_compras) if avg_compras is not None else "—",
             "—",
             "—",
@@ -604,22 +604,27 @@ def main(argv=None):
     # Load .env BEFORE reading PDF_FILE, otherwise the var isn't set yet.
     from dotenv import load_dotenv
 
-    load_dotenv()
+    from paths import ENV_FILE, OUTPUTS_DIR, from_root
+
+    load_dotenv(ENV_FILE)
     # Path precedence: CLI arg -> PDF_FILE env var (.env).
     pdf_path = argv[0] if argv else os.getenv("PDF_FILE")
     if not pdf_path:
         sys.exit("Usage: python extract_codes.py <file.pdf>  (or set PDF_FILE)")
 
-    text = pdf_to_text(pdf_path)
+    # Both sources may be relative ("docs/CARPETA ....pdf"); anchor them on the
+    # repo root so the command works from anywhere, not only from apps/api.
+    text = pdf_to_text(from_root(pdf_path))
+
+    OUTPUTS_DIR.mkdir(exist_ok=True)
     # Keep the intermediate extracted text for inspection/debugging.
-    with open("output.md", "w", encoding="utf-8") as fh:
-        fh.write(text)
+    (OUTPUTS_DIR / "output.md").write_text(text, encoding="utf-8")
 
     table = build_monthly_table(text)
-    with open("ventas_por_mes.md", "w", encoding="utf-8") as fh:
-        fh.write(table)
+    report = OUTPUTS_DIR / "ventas_por_mes.md"
+    report.write_text(table, encoding="utf-8")
     print(table)
-    print("-> ventas_por_mes.md")
+    print(f"-> {report}")
 
 
 if __name__ == "__main__":
