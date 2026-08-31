@@ -162,6 +162,16 @@ def save_extraction(
     return document_id
 
 
+def _taxpayer_name(client, rut: str) -> str | None:
+    """The registered name for a RUT, or None when it has none.
+
+    A plain lookup rather than a PostgREST embed: the embed needs the foreign-key
+    relationship to be introspectable and can fail with PGRST125.
+    """
+    res = client.table("taxpayer").select("nombre").eq("rut", rut).limit(1).execute()
+    return res.data[0]["nombre"] if res.data else None
+
+
 def latest_document(rut: str, user_id: str) -> dict | None:
     """Return the caller's most recent document for a RUT, or None.
 
@@ -187,16 +197,7 @@ def latest_document(rut: str, user_id: str) -> dict | None:
         return None
     doc = docs.data[0]
 
-    # Taxpayer name via a plain lookup (no PostgREST embed, which needs the FK
-    # relationship to be introspectable and can fail with PGRST125).
-    tp = (
-        client.table("taxpayer")
-        .select("nombre")
-        .eq("rut", doc["rut"])
-        .limit(1)
-        .execute()
-    )
-    nombre = tp.data[0]["nombre"] if tp.data else None
+    nombre = _taxpayer_name(client, doc["rut"])
 
     decls = (
         client.table("declaration")
@@ -232,25 +233,150 @@ def list_taxpayers(user_id: str) -> list[dict]:
     """Return the taxpayers this user has uploaded, as [{"rut", "nombre"}, ...].
 
     `taxpayer` holds identities, not ownership — the same RUT can be uploaded by
-    several users — so the caller's RUTs come from their own `document` rows and
-    the names are looked up afterwards.
+    several users — so the caller's RUTs come from their own `document` rows.
+
+    One row per distinct RUT comes back, because the DISTINCT and the name join
+    both happen in Postgres (see `user_taxpayers` in schema.sql). Reducing the
+    document rows to a set here instead would transfer one row per upload, which
+    grows without bound while the answer stays the same size.
     """
     client = _client()
-    docs = (
-        client.table("document").select("rut").eq("user_id", user_id).execute()
-    )
-    ruts = sorted({d["rut"] for d in (docs.data or [])})
-    if not ruts:
-        return []
+    res = client.rpc("user_taxpayers", {"p_user_id": user_id}).execute()
+    return res.data or []
 
-    res = (
-        client.table("taxpayer")
-        .select("rut, nombre")
-        .in_("rut", ruts)
-        .order("rut")
+
+def search_taxpayers(
+    user_id: str, rut_query: str | None, limit: int = 50
+) -> list[dict]:
+    """The caller's taxpayers whose RUT matches `rut_query`, as [{"rut", "nombre"}].
+
+    Matches the **RUT only** — never the name. A query is always read as a RUT
+    fragment, so searching "Frutam" deliberately returns nothing while "79527050"
+    finds 79.527.050-7. See `search_taxpayers` in schema.sql for the folding
+    rules (dots and hyphens stripped on both sides, substring not prefix, upper()
+    for the 'K' verifier digit).
+
+    An empty or blank query returns everything, so `/ruts?q=` degrades to the
+    unfiltered list rather than to no results.
+
+    Like list_taxpayers, the work happens in Postgres: filtering here would
+    transfer every taxpayer the user owns on every keystroke.
+    """
+    client = _client()
+    res = client.rpc(
+        "search_taxpayers",
+        {"p_user_id": user_id, "p_rut": rut_query, "p_limit": limit},
+    ).execute()
+    return res.data or []
+
+
+def declaration_periods(rut: str, user_id: str) -> list[dict]:
+    """The (year, month) periods the caller holds for a RUT, in order.
+
+    Returns [{"year": 2024, "month": 3}, ...] — calendar coverage, no figures.
+    The period picker needs to know which months exist before it can offer them,
+    and answering that with rut_timeline() would transfer every code and total
+    of a whole timeline to count months.
+
+    Merged across all the user's uploads for the RUT, like rut_timeline: the
+    periods available are the union of the uploads, not the newest one's window.
+
+    An empty list means the caller has nothing stored for the RUT — the same
+    "nothing stored" answer the other reads give, and for the same reason: a RUT
+    another user uploaded must not be readable here.
+    """
+    client = _client()
+    res = client.rpc(
+        "declaration_periods", {"p_rut": rut, "p_user_id": user_id}
+    ).execute()
+    return res.data or []
+
+
+def _period_bound(bound: tuple[int, int] | None) -> int | None:
+    """(2023, 3) -> 202303, the AAAA*100+MM form declaration_timeline() compares.
+
+    None passes through as "no bound on this side".
+    """
+    return None if bound is None else bound[0] * 100 + bound[1]
+
+
+def rut_timeline(
+    rut: str,
+    user_id: str,
+    desde: tuple[int, int] | None = None,
+    hasta: tuple[int, int] | None = None,
+) -> dict | None:
+    """The caller's whole timeline for a RUT, merged across all their uploads.
+
+    Where latest_document() reports one upload, this reports the RUT: for each
+    period it keeps the figures from the most recently uploaded document that
+    declares it (see `declaration_timeline` in schema.sql). A user holding a
+    2021-2024 carpeta and a 2023-2026 one can therefore report 2021-2026, which
+    no single document covers.
+
+    `desde`/`hasta` are inclusive (year, month) bounds applied in SQL, so a
+    narrow range transfers only the months it asks for.
+
+    Returns None when this user has no documents for the RUT — the same "nothing
+    stored" answer latest_document() gives, and for the same reason: a RUT
+    another user uploaded must not be readable here.
+
+    Shape matches latest_document()'s, plus `documents` (how many uploads the
+    timeline draws on), so the API renders both without branching:
+        {"document_id", "rut", "nombre", "source_file", "extracted_at",
+         "documents", "rows": [{"year", "month", "folio", "invoices",
+                                "codes": {...}, "sales", "compras"}, ...]}
+    """
+    client = _client()
+    # Provenance comes from the newest document: it is what the report is dated
+    # by, and its absence is what "nothing stored for this RUT" means.
+    docs = (
+        client.table("document")
+        .select("id, rut, source_file, extracted_at")
+        .eq("rut", rut)
+        .eq("user_id", user_id)
+        .order("id", desc=True)
         .execute()
     )
-    return res.data or []
+    if not docs.data:
+        return None
+    newest = docs.data[0]
+
+    rows = (
+        client.rpc(
+            "declaration_timeline",
+            {
+                "p_rut": rut,
+                "p_user_id": user_id,
+                "p_desde": _period_bound(desde),
+                "p_hasta": _period_bound(hasta),
+            },
+        )
+        .execute()
+        .data
+        or []
+    )
+
+    return {
+        "document_id": newest["id"],
+        "rut": newest["rut"],
+        "nombre": _taxpayer_name(client, newest["rut"]),
+        "source_file": newest["source_file"],
+        "extracted_at": newest["extracted_at"],
+        "documents": len(docs.data),
+        "rows": [
+            {
+                "year": d["year"],
+                "month": d["month"],
+                "folio": d.get("folio"),
+                "invoices": d.get("invoices"),
+                "codes": {c: d[_CODE_COL[c]] for c in ALL_CODES},
+                "sales": d["sales"],
+                "compras": d["compras"],
+            }
+            for d in rows
+        ],
+    }
 
 
 def get_profile(user_id: str) -> dict | None:

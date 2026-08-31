@@ -98,6 +98,17 @@ screen and *Descargar PDF* produces the same report `/extract.pdf` returns.
 Uploads are recorded against your account — one user never sees another's
 documents.
 
+To work with a company you already uploaded, find it under **Documentos
+anteriores**. The search box matches the **RUT**, not the company name: puntos
+and the guion are ignored, so `76.044.491-K`, `76044491` and even `044491` all
+find the same company.
+
+Opening one shows its whole timeline, merged across every carpeta you uploaded
+for that RUT. The **Desde / Hasta** selectors then narrow it to the months you
+want, offering only months actually stored — so a carpeta running Nov 2022 to
+Sep 2024 offers Nov and Dic in 2022, and Ene to Sep in 2024. *Descargar PDF*
+renders exactly the span on screen.
+
 ### Endpoints
 
 All endpoints require `Authorization: Bearer <supabase access token>`.
@@ -106,8 +117,12 @@ All endpoints require `Authorization: Bearer <supabase access token>`.
 | ------- | ---------------- | --------------------------------------------------- |
 | `GET`   | `/me`            | The caller's profile: `{"id", "email", "nombre"}`   |
 | `PATCH` | `/me`            | Edit name, email or password                        |
-| `GET`   | `/ruts`          | RUTs this user has uploaded                         |
+| `GET`   | `/ruts`          | RUTs this user has uploaded; `?q=` filters by RUT (not by name) |
+| `GET`   | `/periods/{rut}` | The `(year, month)` periods stored for a RUT        |
 | `GET`   | `/history/{rut}` | The user's latest stored extraction for a RUT (JSON) |
+| `GET`   | `/history/{rut}.pdf` | The same PDF report, rebuilt from the stored rows |
+| `GET`   | `/report/{rut}`  | The RUT's merged timeline, narrowed to `?desde=&hasta=` (`AAAA-MM`) |
+| `GET`   | `/report/{rut}.pdf` | That narrowed report as a PDF                    |
 | `POST`  | `/extract`       | JSON: `{"unit": "miles de pesos", "months": [...]}` |
 | `POST`  | `/extract.md`    | Markdown table (`text/markdown`)                    |
 | `POST`  | `/extract.pdf`   | PDF download: taxpayer header (Nombre/Razón Social + RUT) + Período\|Ventas table |

@@ -31,9 +31,9 @@ scripts/      run-api.mjs, the launcher Turborepo uses for the API
 | File | Role |
 |---|---|
 | `apps/api/extract_codes.py` | The real logic. `pdf_to_text()` (pdfplumber), regex `extract_codes()`, `split_by_period()`, `monthly_rows()` (structured per-month data), `extract_taxpayer()` (Nombre/Razón Social + RUT from the header), `build_monthly_table()` (Markdown report). Importable and CLI-runnable. |
-| `apps/api/api.py` | FastAPI HTTP layer. Reuses `extract_codes` — stages the upload in a temp file, calls `monthly_rows()`, and applies the round-to-thousand presentation. Serves JSON / Markdown and a `/extract.pdf` download (`build_pdf()` via **fpdf2**, taxpayer header + Período\|Ventas table), plus `/me` and `/history/{rut}`. Adds no extraction logic of its own, and renders **no HTML** — the UI is `apps/web/`. |
+| `apps/api/api.py` | FastAPI HTTP layer. Reuses `extract_codes` — stages the upload in a temp file, calls `monthly_rows()`, and applies the round-to-thousand presentation. Serves JSON / Markdown and a `/extract.pdf` download (`build_pdf()` via **fpdf2**, taxpayer header + Período\|Ventas table), plus `/me`, `/history/{rut}` and the period-ranged `/report/{rut}[.pdf]`. Adds no extraction logic of its own, and renders **no HTML** — the UI is `apps/web/`. |
 | `apps/api/auth.py` | Verifies the Supabase access token on every request (`current_user` dependency). Never issues tokens and never sees a password. |
-| `apps/api/storage.py` | Supabase persistence: extractions (scoped by `document.user_id`) and the `profile` table. The only module that talks to Supabase. |
+| `apps/api/storage.py` | Supabase persistence: extractions (scoped by `document.user_id`) and the `profile` table. The only module that talks to Supabase. `search_taxpayers()` and `declaration_periods()` back the RUT search and the period picker; both are RPCs, not Python filters. |
 | `apps/web/` | React + TypeScript (Vite) front end — the app users actually see. Login, drag-and-drop extraction, profile editing. |
 | `apps/api/paths.py` | Repo-root-relative locations (`.env`, `docs/`, `outputs/`), anchored on `__file__` rather than the cwd. |
 
@@ -53,19 +53,136 @@ filter would leak one user's tax documents to another.
 The **service_role** key (`SUPABASE_KEY`) stays server-side — it bypasses RLS.
 The browser only ever gets the **anon** key (`VITE_SUPABASE_ANON_KEY`).
 
+### The PDF report
+
+`build_pdf()` renders the same ten columns as the screen and the Markdown
+report. Column widths are hand-tuned in millimetres so two tables sit side by
+side on landscape A4 (the 2x2 grid); if you add or rename a column, re-measure
+with `get_string_width` against **both** the widest real cell and the longest
+single word of the header — `emit_header` wraps labels with `multi_cell`, so a
+column narrower than its longest word breaks it mid-word.
+
+The report is reachable three ways: `POST /extract.pdf` for a file being
+uploaded, `GET /history/{rut}.pdf` for a stored document, and
+`GET /report/{rut}.pdf?desde=&hasta=` for a stored document narrowed to a period
+range. The two stored routes re-render from the saved rows because the uploaded
+file itself is never kept. All three go through `build_pdf`, so they cannot
+drift apart.
+
+The header block's height is no longer hand-tuned: `emit_header` measures each
+label's wrapped line count with `multi_cell(dry_run=True)` and sizes `HEAD_H` to
+the tallest, so a renamed column can't overflow its box onto the first data row.
+The 2x2 grid pitch follows the tallest table actually drawn, which is what keeps
+a three-month range from leaving most of the page blank.
+
+### The RUT is the reporting unit, not the upload
+
+A carpeta tributaria covers a fixed window (24 or 36 months), so a user who
+uploads several over time holds more periods for a RUT than any one document
+contains. `storage.rut_timeline()` merges them: for each `(year, month)` it keeps
+the figures from the **most recently uploaded document that declares it**
+(`declaration_timeline` in `schema.sql`, a `distinct on (year, month) … order by
+year, month, d.id desc`).
+
+Consequences worth knowing before changing it:
+
+- Uploads are **additive**. Re-uploading a corrected carpeta supersedes only the
+  months it actually contains, instead of shadowing everything older.
+- `/report/{rut}` is the RUT's timeline; `/history/{rut}` is still one upload
+  with its provenance. They answer different questions — don't collapse them.
+- Reporting `latest_document()` alone silently hides data: on the sample project
+  one RUT had 54 stored periods (Nov 2021–Abr 2026) of which the newest document
+  covered 36, so 18 were unreachable.
+
+The range is applied **in SQL**, not by filtering rows in Python: `rut_timeline`
+takes `desde`/`hasta` bounds, so a three-month report reads three months. The
+renderers still receive the unbounded timeline as `all_rows`, because the
+year-over-year lookup needs the months outside the range.
+
+`list_taxpayers()` likewise goes through `user_taxpayers` rather than pulling
+every document row and reducing it to a set in Python — that cost one row per
+upload forever to answer with a list the size of the RUT count.
+
+### Finding a company: the search is by RUT, never by name
+
+`GET /ruts?q=` narrows the stored companies, and it matches the **RUT only**.
+Searching a company name returns nothing. That is deliberate, not a gap — say so
+before "fixing" it, because the obvious repair (adding `t.nombre ilike …` to
+`search_taxpayers`) silently changes what the field means.
+
+Both sides of the comparison are folded to bare uppercase alphanumerics
+(`regexp_replace(…, '[^0-9a-zA-Z]', '', 'g')`), which is what makes the search
+usable on a value nobody types consistently:
+
+- `79527050`, `795270507`, `79.527.050` and `79527050-7` all find
+  `79.527.050-7`.
+- The match is a **substring, not a prefix**, so a half-remembered middle
+  section still finds the company.
+- `upper()` covers the `K` verifier digit — the only letter a RUT contains, and
+  the only reason case still matters now that names are not searched.
+- The fold also makes `LIKE` wildcards inert: `%` and `_` are stripped rather
+  than interpreted, so a query cannot widen its own pattern.
+- A query that folds to nothing degrades to the unfiltered list, matching a
+  blank query.
+
+The frontend says all this on the field itself (`TaxpayerSearch`), because a
+user who types a name, gets nothing and cannot see why will reasonably conclude
+the search is broken.
+
+### The period picker offers only months that exist
+
+`GET /periods/{rut}` returns the `(year, month)` pairs the caller actually
+holds, merged across their uploads like `/report` — calendar coverage, no
+figures, because asking `/report` would transfer a whole timeline to answer a
+question about which months are there.
+
+`PeriodPicker` is populated from that, and a year lists only its own declared
+months: a carpeta running Nov 2022 - Sep 2024 offers Nov/Dic in 2022 and Ene-Sep
+in 2024, never the twelve calendar months. This is what stops the picker
+producing a span the API answers with a 404 — both bounds are always real stored
+periods, and a closed ordered range between two of them contains at least one.
+
+Deriving the options from the loaded document instead (what the picker did
+before) is wrong twice over: it offers undeclared months, and it hides the
+months a *different* upload for the same RUT contributed.
+
+### Period ranges
+
+`PeriodRange` in `api.py` is the one definition of what `?desde=`/`?hasta=`
+(`AAAA-MM`, inclusive, either side optional) mean, and the `period_range`
+dependency validates them for every route that takes them. Two rules travel with
+it, and both matter when touching any renderer:
+
+- The **accumulated** columns restart at `desde` — they sum only the months on
+  the report.
+- The **year-over-year** columns still compare against the same month a year
+  earlier even when it falls outside the range. That is why the renderers take
+  both `rows` (what to draw) and `all_rows` (what to look up in): filtering the
+  lookup too would blank out the `% Var` column of the report's first year.
+
+The filter is presentation only. `pdf_to_rows()` persists the whole document
+regardless, so narrowing a report never narrows what is stored.
+
 ### Keeping the frontend table honest
 
 `apps/web/src/lib/table.ts` recomputes the things the `/extract` payload does not
 carry — the Ene–Dic blank padding (`fill_year_months`), the **Total** row and
 its deficit flag (`year_is_complete`), and the **Promedio** row
 (`_YearAggregator`). Those rules are duplicated from Python on purpose, so the
-screen, the Markdown report and the PDF agree. Two consequences when editing:
+screen, the Markdown report and the PDF agree. Three consequences when editing:
 
 - Change one side and you must change the other, or the same document reads
   differently in the browser and in the downloaded PDF.
 - `apps/web/src/lib/format.ts` has `roundHalfEven`, because Python's `round()` breaks
   ties toward even and JavaScript's `Math.round` breaks them upward. Use it for
   anything mirroring a Python `round()`.
+- `table.ts`'s `monthSpan` mirrors `PeriodRange.months_of`: with a range in
+  force, only the boundary years are clipped. Get this wrong and the screen pads
+  months the server deliberately left out, showing them as undeclared.
+
+The period picker deliberately does **not** filter on the client. It re-requests
+`/report/{rut}`, because restarting the accumulated columns while still looking
+up the previous year needs rows the browser was never sent.
 
 ### Key conventions
 

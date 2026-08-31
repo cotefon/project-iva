@@ -89,12 +89,34 @@ PERIOD_RE = PERIOD_MMYYYY_RE
 # "Corrige a Folio(s):" (lower-case) never matches.
 FOLIO_RE = re.compile(r"FOLIO.*?(\d{7,})")
 
-# Taxpayer identity, from the carpeta header ("Nombre del emisor: ...",
-# "RUT del emisor: 79527050 − 7"). The value runs to the end of the line.
-EMISOR_NAME_RE = re.compile(r"Nombre del emisor:\s*(.+)")
+# Taxpayer identity, from the document header. The label is not spelled the same
+# in every document we get, so each field is a list of patterns tried in order:
+#
+#   "Nombre del emisor: ..."  / "RUT del emisor: 79527050 − 7"   carpeta tributaria
+#   "Nombre del Emisor: ..."  / "RUT del Emisor: 76044491-K"     same, capitalised
+#   "Nombre/Razón Social: ..." / "RUT: 76.044.491-K"             resumen IVA
+#
+# The emisor labels come first: the bare "RUT:" fallback is generic enough to hit
+# an unrelated line in a carpeta, so it must only be reached when no "RUT del
+# emisor" exists in the document at all.
+#
+# Values run to the end of the line. `re.I` covers the emisor/Emisor casing; the
+# pypdf backend pads the label with spaces, which `\s*` absorbs.
+EMISOR_NAME_RES = [
+    re.compile(r"Nombre\s+del\s+emisor\s*:\s*(.+)", re.I),
+    re.compile(r"Nombre\s*/\s*Raz[oó]n\s+Social\s*:\s*(.+)", re.I),
+]
 # RUT body then verifier digit, tolerant of any dash (hyphen, U+2212, en/em dash)
-# and surrounding spaces: "79527050 − 7" or "79.527.050-7".
-EMISOR_RUT_RE = re.compile(r"RUT del emisor:\s*([\d.]+)\s*[-−–—]\s*([\dkK])")
+# and surrounding spaces: "79527050 − 7", "79.527.050-7" or "76044491-K".
+EMISOR_RUT_RES = [
+    re.compile(r"RUT\s+del\s+emisor\s*:\s*([\d.]+)\s*[-−–—]\s*([\dkK])", re.I),
+    re.compile(r"^RUT\s*:\s*([\d.]+)\s*[-−–—]\s*([\dkK])", re.I | re.M),
+]
+
+
+def _first_match(patterns: list[re.Pattern], text: str) -> re.Match | None:
+    """The first pattern in `patterns` that matches anywhere in `text`."""
+    return next(filter(None, (p.search(text) for p in patterns)), None)
 
 
 def format_rut(body: str, dv: str) -> str:
@@ -107,11 +129,11 @@ def format_rut(body: str, dv: str) -> str:
 def extract_taxpayer(text: str) -> dict:
     """Pull the taxpayer's name and RUT from the carpeta header.
 
-    Returns {"nombre": str | None, "rut": str | None}; a field is None when its
-    label is absent from the document.
+    Returns {"nombre": str | None, "rut": str | None}; a field is None when none
+    of its label spellings appear in the document.
     """
-    name_m = EMISOR_NAME_RE.search(text)
-    rut_m = EMISOR_RUT_RE.search(text)
+    name_m = _first_match(EMISOR_NAME_RES, text)
+    rut_m = _first_match(EMISOR_RUT_RES, text)
     return {
         "nombre": name_m.group(1).strip() if name_m else None,
         "rut": format_rut(rut_m.group(1), rut_m.group(2)) if rut_m else None,
@@ -356,14 +378,21 @@ def group_rows_by_year(rows: list[dict]) -> list[tuple[int, list[dict]]]:
     return [(year, list(g)) for year, g in groupby(rows, key=lambda r: r["year"])]
 
 
-def fill_year_months(year: int, year_rows: list[dict]) -> list[dict]:
-    """Return the year's twelve months in order, padding the ones not declared.
+def fill_year_months(
+    year: int, year_rows: list[dict], first_month: int = 1, last_month: int = 12
+) -> list[dict]:
+    """Return the year's months in order, padding the ones not declared.
 
     `year_rows` is one year's slice of monthly_rows(). A month with no F29
     declaration in the document becomes a placeholder carrying only its identity
     plus `blank: True`, so every year table spans Ene-Dic. Renderers print a dash
     in each value column of a blank month rather than a computed zero — an
     unfiled month must never read as a month that declared nothing.
+
+    `first_month`/`last_month` narrow that span, for a report restricted to a
+    period range: a range starting in Mar 2023 pads 2023 from Mar, not from Ene,
+    so months outside the requested range are absent rather than shown as
+    undeclared. They default to the full Ene-Dic year.
     """
     by_month = {r["month"]: r for r in year_rows}
     return [
@@ -377,7 +406,7 @@ def fill_year_months(year: int, year_rows: list[dict]) -> list[dict]:
                 "blank": True,
             },
         )
-        for m in range(1, 13)
+        for m in range(first_month, last_month + 1)
     ]
 
 

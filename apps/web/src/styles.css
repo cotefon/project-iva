@@ -164,6 +164,70 @@ button.link {
   flex-wrap: wrap;
 }
 
+/* RUT search over the stored companies. Sits between the "Documentos
+   anteriores" heading and the list it filters. */
+.taxpayer-search {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin: 0 0 0.75rem;
+}
+.taxpayer-search label {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.taxpayer-search input {
+  font: inherit;
+  padding: 0.35rem 0.5rem;
+  min-width: 16rem;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #fff;
+}
+.taxpayer-search input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.taxpayer-search .muted {
+  font-size: 0.8rem;
+}
+
+/* Desde/Hasta period selectors. Sits between the toolbar and the tables it
+   narrows, wrapping onto two lines on a narrow window rather than shrinking the
+   selects below their month names. */
+.period-picker {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin: 0 0 1rem;
+  padding: 0.6rem 0.8rem;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+.period-side {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.period-side > span {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.period-picker select {
+  font: inherit;
+  padding: 0.35rem 0.4rem;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #fff;
+}
+.period-picker select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 /* The ten-column year tables don't fit the 72rem reading column, so each one
    breaks out of it and spans the window (up to 96rem), staying centred. The
    heading rides along, keeping its left edge on the table's. On a narrow window

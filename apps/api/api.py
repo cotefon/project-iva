@@ -12,11 +12,18 @@ history endpoints only ever return the caller's own documents.
 Endpoints (all authenticated):
     GET   /me             the caller's profile: {"id", "email", "nombre"}.
     PATCH /me             edit the profile (nombre) and credentials (email/password).
-    GET   /ruts           the RUTs this user has uploaded.
+    GET   /ruts           the RUTs this user has uploaded; ?q= filters by RUT.
+    GET   /periods/{rut}  the (year, month) periods stored for a RUT.
     GET   /history/{rut}  the user's latest stored extraction for a RUT, as JSON.
+    GET   /report/{rut}   the same, narrowed to ?desde=&hasta= (AAAA-MM).
+    GET   /report/{rut}.pdf  that narrowed report as a PDF.
     POST  /extract        JSON: {"unit": "miles de pesos", "months": [...]}.
     POST  /extract.md     Markdown table (text/markdown), values in thousands.
     POST  /extract.pdf    the rendered PDF report.
+
+The /report routes are the period-range pair: they read the stored document (the
+uploaded file is never kept) and render only the months the caller asked for.
+Their /history counterparts always render the whole document.
 
 The extraction logic lives in `extract_codes.py`; this module only handles the
 HTTP layer, temp-file plumbing, and the round-to-thousand presentation. The UI
@@ -27,10 +34,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import tempfile
 from typing import NamedTuple
 
-from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
@@ -83,6 +91,114 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
 )
+
+
+# A period bound as the API takes it: "2024-03" (AAAA-MM).
+PERIOD_RE = re.compile(r"^(\d{4})-(\d{1,2})$")
+
+
+class PeriodRange(NamedTuple):
+    """An inclusive [desde, hasta] filter over (year, month), either side open.
+
+    Every report endpoint accepts `?desde=&hasta=` and narrows its tables to the
+    range. Two rules make the narrowed report mean what it says:
+
+    - The **accumulated** columns restart at `desde`, because they sum only the
+      months on the report. A range starting in Mar 2023 accumulates from Mar.
+    - The **year-over-year** columns still compare against the same month a year
+      earlier even when that month falls outside the range. The renderers
+      therefore take both the narrowed rows and the full set: what is *rendered*
+      is narrowed, what is *looked up* is not. Filtering the lookup too would
+      blank out the variation of the first year on every report.
+
+    The filter is presentation only: `pdf_to_rows()` persists the whole document
+    regardless, so narrowing a report never narrows what is stored.
+    """
+
+    desde: tuple[int, int] | None = None
+    hasta: tuple[int, int] | None = None
+
+    @property
+    def is_open(self) -> bool:
+        """True when neither bound is set, i.e. the whole document is reported."""
+        return self.desde is None and self.hasta is None
+
+    def months_of(self, year: int) -> tuple[int, int]:
+        """The (first, last) month to show for `year`, as fill_year_months bounds.
+
+        Only the boundary years are clipped: with Mar 2023 - Ago 2024, 2023 runs
+        Mar-Dic, 2024 runs Ene-Ago, and any year between them stays Ene-Dic.
+        """
+        first = self.desde[1] if self.desde and self.desde[0] == year else 1
+        last = self.hasta[1] if self.hasta and self.hasta[0] == year else 12
+        return first, last
+
+    def as_json(self) -> dict:
+        """The range as the frontend receives it: {"desde": "2023-03", ...}."""
+
+        def fmt_period(p):
+            return None if p is None else f"{p[0]:04d}-{p[1]:02d}"
+
+        return {"desde": fmt_period(self.desde), "hasta": fmt_period(self.hasta)}
+
+    def label(self) -> str:
+        """Human-readable span for a report header: "Mar 2023 - Ago 2024".
+
+        Latin-1 only (a plain hyphen, not an en dash), since the PDF's core
+        Helvetica cannot encode one. An open side reads "Desde ..." / "Hasta
+        ...", and a fully open range reports the whole document.
+        """
+
+        def month_year(p):
+            return f"{SPANISH_MONTHS.get(p[1], p[1])} {p[0]}"
+
+        if self.is_open:
+            return "Todos los períodos del documento"
+        if self.desde and self.hasta:
+            return f"{month_year(self.desde)} - {month_year(self.hasta)}"
+        if self.desde:
+            return f"Desde {month_year(self.desde)}"
+        return f"Hasta {month_year(self.hasta)}"
+
+
+def _parse_period(value: str | None, field: str) -> tuple[int, int] | None:
+    """'2024-03' -> (2024, 3). None/empty means "no bound on this side"."""
+    if not value or not value.strip():
+        return None
+    match = PERIOD_RE.match(value.strip())
+    if not match:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{field}' debe tener el formato AAAA-MM (por ejemplo 2024-03).",
+        )
+    year, month = int(match.group(1)), int(match.group(2))
+    if not 1 <= month <= 12:
+        raise HTTPException(
+            status_code=400, detail=f"'{field}': el mes debe estar entre 01 y 12."
+        )
+    return (year, month)
+
+
+def period_range(
+    desde: str | None = Query(
+        None, description="Primer período del informe, AAAA-MM (por ejemplo 2023-03)."
+    ),
+    hasta: str | None = Query(
+        None, description="Último período del informe, AAAA-MM (por ejemplo 2024-08)."
+    ),
+) -> PeriodRange:
+    """FastAPI dependency: the `?desde=&hasta=` filter, validated.
+
+    Shared by every report endpoint so the JSON, the Markdown and the PDF cannot
+    disagree about what a range means. Omitting both reports the whole document.
+    """
+    rng = PeriodRange(_parse_period(desde, "desde"), _parse_period(hasta, "hasta"))
+    if rng.desde and rng.hasta and rng.desde > rng.hasta:
+        raise HTTPException(
+            status_code=400,
+            detail="El período 'desde' no puede ser posterior a 'hasta'.",
+        )
+    return rng
 
 
 def thousands_by_period(rows: list[dict]) -> dict:
@@ -240,13 +356,36 @@ def pdf_to_rows(
 
 
 @app.get("/ruts")
-async def list_ruts(user: User = Depends(current_user)):
+async def list_ruts(
+    q: str | None = Query(
+        None,
+        description=(
+            "Filtra por RUT (fragmento). Los puntos y el guion se ignoran, "
+            "de modo que 79527050 y 79.527.050-7 encuentran lo mismo. "
+            "No busca por nombre."
+        ),
+    ),
+    user: User = Depends(current_user),
+):
     """Return the RUTs this user has uploaded, each with its name.
+
+    `?q=` narrows the list by **RUT only** — never by name. A query is read as a
+    RUT fragment with dots and hyphens ignored, so "79527050" finds
+    79.527.050-7 while "Frutam" finds nothing. That is deliberate; see
+    `search_taxpayers` in schema.sql.
+
+    Filtering keeps the same response shape as the unfiltered list, so the
+    frontend renders both through one code path. Omitting `q` (or sending it
+    blank) returns everything, exactly as before.
 
     503 if persistence isn't configured (SUPABASE_URL / SUPABASE_KEY missing).
     """
     try:
-        taxpayers = storage.list_taxpayers(user.id)
+        taxpayers = (
+            storage.search_taxpayers(user.id, q)
+            if q and q.strip()
+            else storage.list_taxpayers(user.id)
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     return {
@@ -256,12 +395,21 @@ async def list_ruts(user: User = Depends(current_user)):
     }
 
 
-def _extract_payload(rows: list[dict]) -> dict:
+def _extract_payload(
+    rows: list[dict],
+    all_rows: list[dict] | None = None,
+    rng: PeriodRange = PeriodRange(),
+) -> dict:
     """The JSON body for a set of monthly rows, all amounts in thousands.
 
     Shared by /extract and /history/{rut} so a freshly uploaded document and a
     stored one arrive in the same shape and the React table renders both without
     branching.
+
+    `rows` is what the report shows (already narrowed to `rng`); `all_rows` is
+    the whole document, used only for the year-over-year lookup so a month at the
+    start of the range still compares against the year before it. `rng` is echoed
+    back as `period` so the frontend knows which span it is rendering.
     """
 
     # (prev / curr - 1) * 100, or None when undefined (no matching month a year
@@ -272,7 +420,7 @@ def _extract_payload(rows: list[dict]) -> dict:
 
     # Accumulated Venta del mes / Compras reset each year, matching the per-year
     # tables the other endpoints render.
-    lookup = thousands_by_period(rows)
+    lookup = thousands_by_period(all_rows if all_rows is not None else rows)
     months = []
     for _year, year_rows in group_rows_by_year(rows):
         acc_sales = acc_compras = 0
@@ -313,19 +461,42 @@ def _extract_payload(rows: list[dict]) -> dict:
         "503), un conteo — nunca redondeado al millar. promedio_facturas: Venta "
         "del mes / invoices; null si el mes no declara facturas.",
         "variacion": "*_variacion_pct: (mismo mes año anterior / mes actual) - 1, en porcentaje.",
+        # The requested span, echoed so the caller can label the report and pad
+        # its boundary years to the same months the server did. null/null means
+        # the whole document.
+        "period": rng.as_json(),
         "months": months,
     }
 
 
 @app.post("/extract")
 async def extract(file: UploadFile = File(...), user: User = Depends(current_user)):
-    """Return the monthly sales as JSON, all amounts in thousands of pesos."""
-    _, rows = pdf_to_rows(await file.read(), file.filename or "", user.id)
-    return _extract_payload(rows)
+    """Return the monthly sales as JSON, all amounts in thousands of pesos.
+
+    The whole document is reported; narrowing it to a period range is what the
+    /report routes do. The `taxpayer` block is included for the same reason
+    /history/{rut} carries one: it names the document that was just stored, which
+    is how the caller addresses it as /report/{rut} afterwards — without that,
+    the period picker would have no RUT to ask about a fresh upload. `rut` is
+    null when the header could not be parsed, and such a document is only
+    reachable by re-uploading it.
+    """
+    text, rows = pdf_to_rows(await file.read(), file.filename or "", user.id)
+    return {"taxpayer": extract_taxpayer(text), **_extract_payload(rows)}
 
 
-def _render_table(rows: list[dict], sep: str) -> list[str]:
-    """Shared Markdown lines: one small table per year, its months as rows."""
+def _render_table(
+    rows: list[dict],
+    sep: str,
+    all_rows: list[dict] | None = None,
+    rng: PeriodRange = PeriodRange(),
+) -> list[str]:
+    """Shared Markdown lines: one small table per year, its months as rows.
+
+    `rows` is the selection to render, `all_rows` the whole document (kept for
+    the year-over-year lookup) and `rng` the range that produced the selection,
+    which also clips the Ene-Dic padding of the boundary years.
+    """
     header = [
         "Período",
         "Folio",
@@ -339,7 +510,7 @@ def _render_table(rows: list[dict], sep: str) -> list[str]:
         "Var. Compras",
     ]
     lines: list[str] = []
-    lookup = thousands_by_period(rows)
+    lookup = thousands_by_period(all_rows if all_rows is not None else rows)
     for year, year_rows in group_rows_by_year(rows):
         lines += [
             f"## {year}",
@@ -349,7 +520,7 @@ def _render_table(rows: list[dict], sep: str) -> list[str]:
         ]
         acc_sales = acc_compras = 0
         agg = _YearAggregator()
-        for r in fill_year_months(year, year_rows):
+        for r in fill_year_months(year, year_rows, *rng.months_of(year)):
             # Month not declared in the document: dashes across the row, and it
             # contributes nothing to the accumulators or the yearly totals.
             if r.get("blank"):
@@ -427,7 +598,12 @@ async def extract_markdown(
     return PlainTextResponse("\n".join(body) + "\n", media_type="text/markdown")
 
 
-def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
+def build_pdf(
+    rows: list[dict],
+    taxpayer: dict | None = None,
+    all_rows: list[dict] | None = None,
+    rng: PeriodRange = PeriodRange(),
+) -> bytes:
     """Render the monthly table as a PDF, one small table per year: Mes, Venta
     del mes, Promedio de monto por factura and Compras totals (values in thousands).
 
@@ -436,6 +612,12 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
 
     `taxpayer` is the {"nombre", "rut"} dict from extract_taxpayer(); its fields
     are printed as a header block above the table when present.
+
+    `rows` is the selection to render; `all_rows` is the whole document, used
+    only for the year-over-year lookup so the first year of a narrowed report
+    keeps its variation column. `rng` is the range that produced the selection:
+    it clips the boundary years' padding and is printed under the taxpayer block
+    so a partial report says so on its face.
 
     fpdf2 is pure-Python and imported lazily to keep the module importable
     without it. Core (Helvetica) fonts are Latin-1, which covers every glyph we
@@ -461,23 +643,18 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
         new_y="NEXT",
         align="C",
     )
-    pdf.set_font("Helvetica", "", 9)
-    pdf.set_text_color(90, 90, 90)
-    pdf.cell(
-        0,
-        6,
-        new_x="LMARGIN",
-        new_y="NEXT",
-    )
-    pdf.set_text_color(0, 0, 0)
     pdf.ln(2)
 
-    # Taxpayer header: label in bold, value in regular, one per line.
+    # Taxpayer header: label in bold, value in regular, one per line. The período
+    # line is only printed for a narrowed report — on a full document it would
+    # just restate the tables below it.
     taxpayer = taxpayer or {}
     fields = [
         ("Nombre / Razón Social", taxpayer.get("nombre")),
         ("RUT", taxpayer.get("rut")),
     ]
+    if not rng.is_open:
+        fields.append(("Período", rng.label()))
     for label, value in fields:
         pdf.set_font("Helvetica", "B", 10)
         pdf.cell(42, 6, f"{label}:", new_x="RIGHT", new_y="TOP")
@@ -487,29 +664,58 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
         )
     pdf.ln(3)
 
-    # Compact per-year table (header, width_mm, align), sized so two sit side by
-    # side within landscape A4's ~277mm usable width. Widths sum to 132mm, so a
-    # pair plus the 8mm column gap needs 272mm; the 2x2 grid places four of them
-    # per page. Amount columns are the widest since they carry up to ~11 chars
-    # ("127.138.974"); Facturas Emitidas holds a 2-4 digit count, so it is narrow.
+    # Compact per-year table (header, width_mm, align), holding the same ten
+    # columns as the on-screen table and the Markdown report, in the same order.
+    #
+    # Sized so two sit side by side within landscape A4's ~277mm usable width:
+    # the widths sum to 133mm, so a pair plus the 8mm column gap needs 274mm and
+    # the 2x2 grid places four of them per page.
+    #
+    # Each width was measured with get_string_width at 6pt against two things:
+    # the widest real cell, and the **longest single word of the header**, which
+    # emit_header wraps with multi_cell. Sizing on the header text as a whole is
+    # not enough — a column narrower than its longest word breaks it mid-word
+    # ("Compra/s", "Emiti/das"). The remaining slack went to the amount columns,
+    # which are the ones that grow with a larger taxpayer.
+    #
+    # The variation headers stay short ("% Var Ventas") and the comparison they
+    # make is spelled out in the footnote, rather than wrapping "Año Anterior"
+    # onto two more lines in every table.
     columns = [
         ("Mes", 11, "L"),
-        ("Ventas", 18, "R"),
-        ("Ventas Acumulado", 19, "R"),
-        ("% Var Ventas Acum Año Anterior", 19, "R"),
+        ("Folio", 13, "R"),
+        ("Ventas", 16, "R"),
+        ("Ventas Acumulado", 16, "R"),
+        ("% Var Ventas", 10, "R"),
         ("Facturas Emitidas", 11, "R"),
-        ("Promedio de monto por factura", 17, "R"),
-        ("Compras", 18, "R"),
-        ("Compras Acumulado", 19, "R"),
+        ("Promedio de monto por factura", 12, "R"),
+        ("Compras", 16, "R"),
+        ("Compras Acumulado", 16, "R"),
+        ("% Var Compras", 12, "R"),
     ]
-    table_w = sum(w for _, w, _ in columns)  # 132mm
+    table_w = sum(w for _, w, _ in columns)  # 133mm
 
     orange = (230, 81, 0)  # matches the HTML deficit colour (#e65100)
     ROW_H = 4.0  # data / total / average row height
-    HEAD_H = 10  # column-header row height (labels wrap onto 2-3 lines)
     TITLE_H = 6  # per-year title height
+    HEAD_LINE_H = 2.8  # one wrapped line of a column header
+    HEAD_PAD = 1.6  # total vertical padding inside the header box
 
-    COMPRAS_COL = 6  # index of "Compras" in `columns`
+    # The column-header height is measured, not hard-coded. emit_header wraps
+    # each label with multi_cell, so a label needing one more line than the box
+    # is tall enough for spills over the first data rows ("Promedio de monto por
+    # factura" wraps onto four lines at 12mm, which a fixed 10mm box clipped).
+    # Ask fpdf how many lines each label actually takes at its own width and
+    # size the box to the tallest, so renaming or renarrowing a column adjusts
+    # the header instead of overflowing it.
+    pdf.set_font("Helvetica", "B", 6)
+    head_lines = [
+        len(pdf.multi_cell(w, HEAD_LINE_H, label, align="C", dry_run=True, output="LINES"))
+        for label, w, _ in columns
+    ]
+    HEAD_H = HEAD_PAD + max(head_lines) * HEAD_LINE_H
+
+    COMPRAS_COL = 7  # index of "Compras" in `columns`
 
     def emit_row(cells, x0, deficit_col=None):
         """Draw one bordered row from `cells` starting at x0, on one line.
@@ -537,17 +743,19 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
     def emit_header(x0):
         """Draw the shaded column-header row at x0, wrapping long labels.
 
-        Each header is a filled, bordered box of fixed height HEAD_H with its
-        (possibly multi-line) label centred inside via multi_cell.
+        Each header is a filled, bordered box of height HEAD_H with its
+        (possibly multi-line) label centred inside via multi_cell — horizontally
+        by `align`, vertically by offsetting the text block by the slack its own
+        line count leaves, so a one-line label sits level with a four-line one.
         """
         pdf.set_font("Helvetica", "B", 6)
         pdf.set_fill_color(244, 244, 245)
         x, y = x0, pdf.get_y()
-        for label, w, _ in columns:
+        for (label, w, _), lines in zip(columns, head_lines):
             pdf.set_xy(x, y)
             pdf.cell(w, HEAD_H, "", border=1, fill=True)
-            pdf.set_xy(x, y + 0.8)
-            pdf.multi_cell(w, 2.8, label, align="C")
+            pdf.set_xy(x, y + (HEAD_H - lines * HEAD_LINE_H) / 2)
+            pdf.multi_cell(w, HEAD_LINE_H, label, align="C")
             x += w
         pdf.set_left_margin(x0)
         pdf.set_xy(x0, y + HEAD_H)
@@ -562,7 +770,7 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
 
     has_incomplete = False
     bottom_y = 0.0
-    lookup = thousands_by_period(rows)
+    lookup = thousands_by_period(all_rows if all_rows is not None else rows)
 
     def render_year(year, year_rows, x0, y0):
         """Draw one year's compact table with its top-left corner at (x0, y0)."""
@@ -576,25 +784,27 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
         acc_sales = acc_compras = 0
         complete = year_is_complete(year_rows)
         agg = _YearAggregator()
-        for r in fill_year_months(year, year_rows):
+        for r in fill_year_months(year, year_rows, *rng.months_of(year)):
             # Month not declared in the document: dashes across the row, and it
             # contributes nothing to the accumulators or the yearly totals.
             if r.get("blank"):
                 emit_row([r["month_name"]] + ["-"] * (len(columns) - 1), x0)
                 continue
             _, sales_k, compras_k = row_in_thousands(r)
-            prev_sales, _ = prior_year(lookup, r)
+            prev_sales, prev_compras = prior_year(lookup, r)
             acc_sales += sales_k
             acc_compras += compras_k
             # Monthly year-over-year variation (this month vs the same month a
-            # year earlier), shown in the "% Var Ventas Acum Año Anterior" column.
+            # year earlier), for Ventas and Compras alike.
             var_sales = pct(prev_sales, sales_k)
+            var_compras = pct(prev_compras, compras_k)
             ventas = money(sales_k) + (" *" if r["missing"] else "")
             compras = money(compras_k) + (" *" if r["missing_compras"] else "")
             if r["missing"] or r["missing_compras"]:
                 has_incomplete = True
             cells = [
                 r["month_name"],
+                r.get("folio") or "-",
                 ventas,
                 money(acc_sales),
                 var_sales,
@@ -602,6 +812,7 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
                 money(avg_invoice(sales_k, r.get("invoices"))),
                 compras,
                 money(acc_compras),
+                var_compras,
             ]
             emit_row(cells, x0)
             agg.add(sales_k, compras_k, r.get("invoices"))
@@ -617,12 +828,14 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
         emit_row(
             [
                 "Total",
+                "-",
                 money(acc_sales),
                 "-",
                 "-",
                 money(agg.tot_invoices or None),
                 "-",
                 money(acc_compras),
+                "-",
                 "-",
             ],
             x0,
@@ -636,12 +849,14 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
         emit_row(
             [
                 "Promedio",
+                "-",
                 money(a.sales),
                 "-",
                 "-",
                 money(a.invoices),
                 money(a.per_factura),
                 money(a.compras),
+                "-",
                 "-",
             ],
             x0,
@@ -656,10 +871,15 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
     col_gap = 8
     x_left = page_left
     x_right = page_left + table_w + col_gap
-    # Every year table is now exactly TITLE_H + HEAD_H + 14*ROW_H high (Ene-Dic,
-    # padded with blank months, plus Total and Promedio); pitch the two grid rows
-    # so the bottom table clears the top one.
-    slot_pitch = TITLE_H + HEAD_H + 14 * ROW_H + 6
+    # A year table is TITLE_H + HEAD_H + (months + 2) * ROW_H high: its padded
+    # months plus the Total and Promedio rows. That is 14 rows on a full Ene-Dic
+    # year, fewer when a period range clips the span, so pitch the two grid rows
+    # by the tallest table actually being drawn rather than by a fixed twelve —
+    # a three-month report would otherwise leave two thirds of the page blank.
+    tallest = max(
+        (len(fill_year_months(y, r, *rng.months_of(y))) for y, r in years), default=12
+    )
+    slot_pitch = TITLE_H + HEAD_H + (tallest + 2) * ROW_H + 6
 
     for start in range(0, len(years), 4):
         group = years[start : start + 4]
@@ -677,20 +897,25 @@ def build_pdf(rows: list[dict], taxpayer: dict | None = None) -> bytes:
         for (year, year_rows), (sx, sy) in zip(group, slots):
             render_year(year, year_rows, sx, sy)
 
-    pdf.set_left_margin(page_left)
+    # Footnotes. The variation note is always shown, since the "% Var" headers
+    # are deliberately short and do not say what they compare against; the
+    # missing-codes note only when some month actually carries the marker.
+    notes = [
+        "% Var Ventas / % Var Compras: variacion respecto del mismo mes del "
+        "ano anterior."
+    ]
     if has_incomplete:
-        note_y = bottom_y + 4
-        if note_y > pdf.h - pdf.b_margin - 8:
-            pdf.add_page()
-            note_y = pdf.t_margin
-        pdf.set_xy(page_left, note_y)
-        pdf.set_font("Helvetica", "", 8)
-        pdf.set_text_color(90, 90, 90)
-        pdf.multi_cell(
-            table_w * 2,
-            5,
-            "* Mes con codigos faltantes (contados como 0).",
-        )
+        notes.append("* Mes con codigos faltantes (contados como 0).")
+
+    pdf.set_left_margin(page_left)
+    note_y = bottom_y + 4
+    if note_y > pdf.h - pdf.b_margin - 8 * len(notes):
+        pdf.add_page()
+        note_y = pdf.t_margin
+    pdf.set_xy(page_left, note_y)
+    pdf.set_font("Helvetica", "", 8)
+    pdf.set_text_color(90, 90, 90)
+    pdf.multi_cell(table_w * 2, 5, "\n".join(notes))
 
     return bytes(pdf.output())
 
@@ -756,12 +981,49 @@ def _stored_rows(doc: dict) -> list[dict]:
     return rows
 
 
-@app.get("/history/{rut}")
-async def history(rut: str, user: User = Depends(current_user)):
-    """The caller's most recent stored extraction for a RUT, in /extract's shape.
+def _timeline_or_404(rut: str, user_id: str, rng: PeriodRange) -> tuple[dict, dict]:
+    """The caller's whole timeline for a RUT, plus the same timeline narrowed.
 
-    Same body as /extract plus the document's provenance, so the frontend renders
-    a stored document with the same table component as a fresh upload.
+    Returns `(full, selected)`. Both come from `storage.rut_timeline`, which
+    merges every document the user uploaded for the RUT — so a report can span
+    more months than any single upload covers.
+
+    The range is applied by the database, not in Python: `selected` is fetched
+    with the bounds, so a three-month report reads three months. `full`
+    is fetched unbounded because the renderers still need the months *outside*
+    the range for the year-over-year lookup — that is the one thing the narrowed
+    query cannot supply.
+
+    Errors mirror _latest_or_404: 503 when persistence is unconfigured, 404 when
+    this user has nothing stored for the RUT (including when another user has
+    uploaded it), and 404 when the range selects no months.
+    """
+    try:
+        full = storage.rut_timeline(rut, user_id)
+        selected = (
+            full
+            if rng.is_open
+            else storage.rut_timeline(rut, user_id, rng.desde, rng.hasta)
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    if full is None or not full["rows"]:
+        raise HTTPException(
+            status_code=404, detail=f"Sin extracciones guardadas para el RUT {rut}."
+        )
+    if selected is None or not selected["rows"]:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"El RUT {rut} no tiene declaraciones en el período solicitado "
+                f"({rng.label()})."
+            ),
+        )
+    return full, selected
+
+
+def _latest_or_404(rut: str, user_id: str) -> dict:
+    """The caller's most recent stored document for a RUT, or the right error.
 
     404 if this user has nothing stored for that RUT — including when another
     user has uploaded it, since one user's documents are never readable by
@@ -769,14 +1031,142 @@ async def history(rut: str, user: User = Depends(current_user)):
     missing), so the reason is explicit.
     """
     try:
-        doc = storage.latest_document(rut, user.id)
+        doc = storage.latest_document(rut, user_id)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     if doc is None:
         raise HTTPException(
             status_code=404, detail=f"Sin extracciones guardadas para el RUT {rut}."
         )
+    return doc
 
+
+# Declared before /history/{rut}: a path parameter matches dots too, so
+# "/history/79.527.050-7.pdf" would otherwise be served by the JSON route with
+# the ".pdf" swallowed into the RUT. Starlette matches in declaration order.
+@app.get("/history/{rut}.pdf")
+async def history_pdf(rut: str, user: User = Depends(current_user)):
+    """The same PDF report as /extract.pdf, rebuilt from a stored document.
+
+    The uploaded file itself is never kept — only the extracted figures — so the
+    report is re-rendered from the stored rows rather than re-parsed. That is
+    what lets a past document be downloaded without uploading the PDF again.
+    """
+    doc = _latest_or_404(rut, user.id)
+    taxpayer = {"nombre": doc["nombre"], "rut": doc["rut"]}
+    # The RUT is in the filename so several downloads stay tellable apart in the
+    # browser's download folder. It is digits, dots and a dash — no quoting or
+    # encoding needed in the header.
+    return Response(
+        content=build_pdf(_stored_rows(doc), taxpayer),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="ventas_{doc["rut"]}.pdf"'
+        },
+    )
+
+
+# Declared before /report/{rut}, for the same reason /history/{rut}.pdf is
+# declared before /history/{rut}: a path parameter matches dots, so the JSON
+# route would otherwise swallow the ".pdf".
+@app.get("/report/{rut}.pdf")
+async def report_pdf(
+    rut: str,
+    rng: PeriodRange = Depends(period_range),
+    user: User = Depends(current_user),
+):
+    """The report for a RUT, narrowed to a period range, as a PDF.
+
+    Two things separate it from /history/{rut}.pdf, which renders one upload:
+
+    - It reports the **RUT**, merging every document the caller uploaded for it,
+      newest declaration winning per period. A 2021-2024 carpeta and a 2023-2026
+      one together report 2021-2026, which neither covers alone.
+    - The caller chooses the span with `?desde=` and `?hasta=` (AAAA-MM, either
+      side optional, both inclusive):
+
+          GET /report/76.044.491-K.pdf?desde=2023-03&hasta=2024-08
+
+      reports Mar-Dic 2023 and Ene-Ago 2024. The accumulated columns restart at
+      `desde`; the year-over-year columns still compare against the same month a
+      year earlier even when it falls outside the range.
+
+    Omitting both bounds reports the RUT's whole timeline.
+    """
+    full, selected = _timeline_or_404(rut, user.id, rng)
+    taxpayer = {"nombre": full["nombre"], "rut": full["rut"]}
+    # The span goes in the filename so downloads of different ranges of the same
+    # RUT do not overwrite each other. Every part is digits, dots and dashes, so
+    # the header needs no quoting.
+    bounds = rng.as_json()
+    span = "".join(f"_{b}" for b in (bounds["desde"], bounds["hasta"]) if b)
+    filename = f"ventas_{full['rut']}{span}.pdf"
+    return Response(
+        content=build_pdf(
+            _stored_rows(selected), taxpayer, _stored_rows(full), rng
+        ),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/report/{rut}")
+async def report(
+    rut: str,
+    rng: PeriodRange = Depends(period_range),
+    user: User = Depends(current_user),
+):
+    """The same narrowed report as /report/{rut}.pdf, as JSON.
+
+    Same body as /history/{rut} — so the React table renders it without
+    branching — plus the `period` block echoing the range that was applied and
+    `documents`, how many uploads the timeline draws on. It exists so the screen
+    can preview exactly what the PDF will contain before the user downloads it.
+    """
+    full, selected = _timeline_or_404(rut, user.id, rng)
+    return {
+        "taxpayer": {"nombre": full["nombre"], "rut": full["rut"]},
+        "document_id": full["document_id"],
+        "source_file": full["source_file"],
+        "extracted_at": full["extracted_at"],
+        "documents": full["documents"],
+        **_extract_payload(_stored_rows(selected), _stored_rows(full), rng),
+    }
+
+
+@app.get("/periods/{rut}")
+async def periods(rut: str, user: User = Depends(current_user)):
+    """The periods this user actually holds for a RUT: [{"year", "month"}, ...].
+
+    Calendar coverage, not figures. The period picker needs to know which months
+    exist before it can offer them, and asking /report for that would transfer a
+    whole timeline to answer a question about which months are there.
+
+    Merged across every upload for the RUT, like /report — so the picker offers
+    the union of the user's carpetas rather than the newest one's window.
+
+    404 when the caller has nothing stored for the RUT, matching the other
+    stored-document routes; a RUT another user uploaded reads the same way.
+    """
+    try:
+        found = storage.declaration_periods(rut, user.id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    if not found:
+        raise HTTPException(
+            status_code=404, detail=f"Sin extracciones guardadas para el RUT {rut}."
+        )
+    return {"rut": rut, "count": len(found), "periods": found}
+
+
+@app.get("/history/{rut}")
+async def history(rut: str, user: User = Depends(current_user)):
+    """The caller's most recent stored extraction for a RUT, in /extract's shape.
+
+    Same body as /extract plus the document's provenance, so the frontend renders
+    a stored document with the same table component as a fresh upload.
+    """
+    doc = _latest_or_404(rut, user.id)
     return {
         "taxpayer": {"nombre": doc["nombre"], "rut": doc["rut"]},
         "document_id": doc["document_id"],

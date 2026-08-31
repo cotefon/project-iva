@@ -1,5 +1,11 @@
 import { supabase } from "./supabase";
-import type { ExtractResponse, Profile, RutsResponse } from "../types";
+import type {
+  ExtractResponse,
+  PeriodRange,
+  PeriodsResponse,
+  Profile,
+  RutsResponse,
+} from "../types";
 
 const BASE = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000";
 
@@ -60,20 +66,20 @@ export async function extract(file: File): Promise<ExtractResponse> {
   return request<ExtractResponse>("/extract", { method: "POST", body });
 }
 
-/** The rendered PDF report for the same file, as a blob plus its filename.
+export type Download = { blob: Blob; filename: string };
+
+/** Fetch a binary response as a blob plus the filename the server chose.
  *
  *  The filename comes from the Content-Disposition header, which the browser
  *  only exposes to JavaScript because the API lists it in the CORS
  *  `expose_headers`. */
-export async function extractPdf(
-  file: File,
-): Promise<{ blob: Blob; filename: string }> {
-  const body = new FormData();
-  body.append("file", file);
-  const res = await fetch(`${BASE}/extract.pdf`, {
-    method: "POST",
-    body,
-    headers: await authHeader(),
+async function downloadRequest(
+  path: string,
+  init: RequestInit = {},
+): Promise<Download> {
+  const res = await fetch(`${BASE}${path}`, {
+    ...init,
+    headers: { ...(await authHeader()), ...(init.headers ?? {}) },
   });
   if (!res.ok) await fail(res);
 
@@ -82,12 +88,68 @@ export async function extractPdf(
   return { blob: await res.blob(), filename: match?.[1] ?? "ventas_por_mes.pdf" };
 }
 
-/** RUTs this user has uploaded before. */
-export const listRuts = () => request<RutsResponse>("/ruts");
+/** The rendered PDF report for a freshly uploaded file. */
+export function extractPdf(file: File): Promise<Download> {
+  const body = new FormData();
+  body.append("file", file);
+  // No Content-Type header: the browser must set the multipart boundary itself.
+  return downloadRequest("/extract.pdf", { method: "POST", body });
+}
+
+/** The same report for a stored document, rebuilt server-side from its saved
+ *  rows — the original upload is not kept, so there is no file to re-send. */
+export function historyPdf(rut: string): Promise<Download> {
+  return downloadRequest(`/history/${encodeURIComponent(rut)}.pdf`);
+}
+
+/** `?desde=&hasta=` for a period range, omitting the bounds that are not set.
+ *  An empty range produces an empty string, so /report/{rut} then means exactly
+ *  what /history/{rut} means: the whole stored document. */
+function rangeQuery(range?: PeriodRange): string {
+  const params = new URLSearchParams();
+  if (range?.desde) params.set("desde", range.desde);
+  if (range?.hasta) params.set("hasta", range.hasta);
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+/** RUTs this user has uploaded before, optionally narrowed by RUT.
+ *
+ *  `query` is matched against the **RUT only**, never the company name: the API
+ *  reads it as a RUT fragment with dots and hyphens ignored, so "79527050"
+ *  finds 79.527.050-7 and a company name finds nothing. Omitting it (or passing
+ *  a blank string) returns the whole list, so the caller keeps one code path. */
+export const listRuts = (query?: string) => {
+  const q = query?.trim();
+  return request<RutsResponse>(
+    q ? `/ruts?${new URLSearchParams({ q })}` : "/ruts",
+  );
+};
+
+/** The (year, month) periods stored for a RUT, ascending.
+ *
+ *  What the period picker offers, so it can only ever produce a span the
+ *  database can answer. 404s when the caller has nothing stored for the RUT. */
+export const storedPeriods = (rut: string) =>
+  request<PeriodsResponse>(`/periods/${encodeURIComponent(rut)}`);
 
 /** The user's latest stored extraction for a RUT. */
 export const history = (rut: string) =>
   request<ExtractResponse>(`/history/${encodeURIComponent(rut)}`);
+
+/** The same stored document narrowed to a period range.
+ *
+ *  Server-side on purpose: the accumulated columns restart at `desde`, and only
+ *  the API can recompute them while still comparing each month against the same
+ *  month a year earlier — which may sit outside the range the caller asked for. */
+export const report = (rut: string, range?: PeriodRange) =>
+  request<ExtractResponse>(
+    `/report/${encodeURIComponent(rut)}${rangeQuery(range)}`,
+  );
+
+/** That narrowed report as a PDF, rendered from the same stored rows. */
+export const reportPdf = (rut: string, range?: PeriodRange) =>
+  downloadRequest(`/report/${encodeURIComponent(rut)}.pdf${rangeQuery(range)}`);
 
 export const getProfile = () => request<Profile>("/me");
 
