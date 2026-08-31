@@ -284,7 +284,7 @@ export function ExtractPage() {
             />
           )}
 
-          {yearTables(result.months, result.period).map((table) => (
+          {yearTables(result.months).map((table) => (
             <YearTable key={table.year} table={table} />
           ))}
         </>

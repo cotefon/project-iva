@@ -21,15 +21,21 @@ export const monthName = (month: number) => MONTHS[month - 1] ?? String(month);
 
 const NUMBER = new Intl.NumberFormat("es-CL");
 
-/** Chilean dot thousands separators; a missing value renders as an em dash.
+/** What every cell with no value prints: an undeclared month, an undefined
+ *  variation, a missing folio. Mirrors extract_codes.BLANK — a plain hyphen,
+ *  because the PDF's core Helvetica font is Latin-1 and cannot encode an em
+ *  dash, so this is the only character all three renderers can agree on. */
+export const BLANK = "-";
+
+/** Chilean dot thousands separators; a missing value renders as BLANK.
  *  Mirrors api.py's `fmt`. */
 export const fmt = (v: number | null | undefined) =>
-  v === null || v === undefined ? "—" : NUMBER.format(v);
+  v === null || v === undefined ? BLANK : NUMBER.format(v);
 
 /** Signed percentage with a Chilean decimal comma: 12.3 -> "+12,3%".
- *  Mirrors extract_codes.format_pct, including the em dash for undefined. */
+ *  Mirrors extract_codes.format_pct, including BLANK for undefined. */
 export const fmtPct = (pct: number | null | undefined) => {
-  if (pct === null || pct === undefined) return "—";
+  if (pct === null || pct === undefined) return BLANK;
   const sign = pct < 0 ? "-" : "+";
   return `${sign}${Math.abs(pct).toFixed(1).replace(".", ",")}%`;
 };

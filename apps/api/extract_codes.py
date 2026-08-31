@@ -43,6 +43,12 @@ COMPRAS_CODES = ["535", "520", "528", "521", "532", "560", "562"]
 # round-to-thousand presentation never touches it. Used to average a year's
 # totals per invoice in the Promedio row.
 INVOICE_CODE = "503"
+
+# What every renderer prints in a cell that has no value: a month with no F29
+# declaration, an undefined variation, a missing folio. A plain hyphen rather
+# than an em dash, because the PDF's core Helvetica font is Latin-1 and cannot
+# encode one — so this is the only character all three renderers can agree on.
+BLANK = "-"
 # Every peso-valued code we extract per declaration (both formulas). The two
 # lists are disjoint, so a plain concatenation holds each code exactly once.
 ALL_CODES = FORMULA_CODES + COMPRAS_CODES
@@ -305,8 +311,8 @@ def variation_pct(prev, curr):
 
 def format_pct(pct) -> str:
     """Format a percentage with a Chilean decimal comma and an explicit sign,
-    e.g. 12.3 -> "+12,3%", -4.0 -> "-4,0%". None (undefined) renders as "—"."""
-    return "—" if pct is None else f"{pct:+.1f}%".replace(".", ",")
+    e.g. 12.3 -> "+12,3%", -4.0 -> "-4,0%". None (undefined) renders as BLANK."""
+    return BLANK if pct is None else f"{pct:+.1f}%".replace(".", ",")
 
 
 def format_variation(prev, curr) -> str:
@@ -314,7 +320,7 @@ def format_variation(prev, curr) -> str:
 
     Compares a month's figure with the same month of the previous year, per the
     reporting convention requested (previous divided by current, minus one).
-    Returns "—" when undefined: no matching month a year earlier, or a current
+    Returns BLANK when undefined: no matching month a year earlier, or a current
     value of 0/None that would divide by zero. Formatted with a Chilean decimal
     comma and an explicit sign, e.g. "+12,3%", "-4,0%".
     """
@@ -436,7 +442,7 @@ def build_monthly_table(markdown: str) -> str:
         "*Promedio de monto por factura* = Venta del mes / cantidad de facturas emitidas "
         "(código 503) del mismo mes.  ·  "
         "Cada año muestra sus doce meses; los meses sin declaración en el "
-        "documento van con — en todas sus columnas.  ·  "
+        "documento van con - en todas sus columnas.  ·  "
         "Las columnas *acumuladas* suman mes a mes dentro de cada año.  ·  "
         "*Var.* = variación respecto al mismo mes del año anterior "
         "`(mismo mes año anterior / mes actual) - 1`.",
@@ -471,7 +477,7 @@ def build_monthly_table(markdown: str) -> str:
             if r.get("blank"):
                 lines.append(
                     "| "
-                    + " | ".join([r["month_name"]] + ["—"] * (len(header) - 1))
+                    + " | ".join([r["month_name"]] + [BLANK] * (len(header) - 1))
                     + " |"
                 )
                 continue
@@ -495,12 +501,12 @@ def build_monthly_table(markdown: str) -> str:
             avg_invoice = per_invoice(sales_k, r["invoices"])
             row = [
                 r["month_name"],
-                r["folio"] or "—",
+                r["folio"] or BLANK,
                 sales,
                 format_int(acc_sales),
                 var_sales,
-                format_int(r["invoices"]) if r["invoices"] is not None else "—",
-                format_int(avg_invoice) if avg_invoice is not None else "—",
+                format_int(r["invoices"]) if r["invoices"] is not None else BLANK,
+                format_int(avg_invoice) if avg_invoice is not None else BLANK,
                 compras,
                 format_int(acc_compras),
                 var_compras,
@@ -515,7 +521,7 @@ def build_monthly_table(markdown: str) -> str:
         # — not over twelve — so a year with two declarations reports the mean of
         # those two. Only the Promedio de monto por factura cell divides by the
         # invoice count instead, matching what that column measures. Acumuladas
-        # and Var. have no meaningful mean ("—").
+        # and Var. have no meaningful mean (BLANK).
         avg = lambda total: total / n_months if n_months else None
         avg_sales = avg(tot_sales)
         avg_compras = avg(tot_compras)
@@ -523,15 +529,15 @@ def build_monthly_table(markdown: str) -> str:
         avg_per_factura = per_invoice(tot_sales, tot_invoices)
         avg_row = [
             "**Promedio**",
-            "—",
-            format_int(avg_sales) if avg_sales is not None else "—",
-            "—",
-            "—",
-            format_int(avg_invoices) if avg_invoices is not None else "—",
-            format_int(avg_per_factura) if avg_per_factura is not None else "—",
-            format_int(avg_compras) if avg_compras is not None else "—",
-            "—",
-            "—",
+            BLANK,
+            format_int(avg_sales) if avg_sales is not None else BLANK,
+            BLANK,
+            BLANK,
+            format_int(avg_invoices) if avg_invoices is not None else BLANK,
+            format_int(avg_per_factura) if avg_per_factura is not None else BLANK,
+            format_int(avg_compras) if avg_compras is not None else BLANK,
+            BLANK,
+            BLANK,
         ]
         lines.append("| " + " | ".join(avg_row) + " |")
         lines.append("")

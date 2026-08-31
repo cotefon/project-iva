@@ -1,4 +1,4 @@
-import { fmt, fmtPct } from "../lib/format";
+import { BLANK, fmt, fmtPct } from "../lib/format";
 import type { TableRow, YearTableData } from "../lib/table";
 
 /** Same ten columns, in the same order, as the Markdown and HTML reports. */
@@ -26,7 +26,7 @@ function Row({ row }: { row: TableRow }) {
         <tr className="blank">
           <td>{row.name}</td>
           {COLUMNS.slice(1).map((c) => (
-            <td key={c}>—</td>
+            <td key={c}>{BLANK}</td>
           ))}
         </tr>
       );
@@ -36,7 +36,7 @@ function Row({ row }: { row: TableRow }) {
       return (
         <tr>
           <td>{row.name}</td>
-          <td>{m.folio ?? "—"}</td>
+          <td>{m.folio ?? BLANK}</td>
           <td>{flag(fmt(m.venta_del_mes), m.missing.length > 0)}</td>
           <td>{fmt(m.venta_acumulada)}</td>
           <td>{fmtPct(m.venta_variacion_pct)}</td>
@@ -53,17 +53,17 @@ function Row({ row }: { row: TableRow }) {
       return (
         <tr className="total">
           <td>Total</td>
-          <td>—</td>
+          <td>{BLANK}</td>
           <td>{fmt(row.sales)}</td>
-          <td>—</td>
-          <td>—</td>
+          <td>{BLANK}</td>
+          <td>{BLANK}</td>
           <td>{fmt(row.invoices)}</td>
-          <td>—</td>
+          <td>{BLANK}</td>
           <td className={row.deficit ? "deficit" : undefined}>
             {fmt(row.compras)}
           </td>
-          <td>—</td>
-          <td>—</td>
+          <td>{BLANK}</td>
+          <td>{BLANK}</td>
         </tr>
       );
 
@@ -71,15 +71,15 @@ function Row({ row }: { row: TableRow }) {
       return (
         <tr className="avg">
           <td>Promedio</td>
-          <td>—</td>
+          <td>{BLANK}</td>
           <td>{fmt(row.sales)}</td>
-          <td>—</td>
-          <td>—</td>
+          <td>{BLANK}</td>
+          <td>{BLANK}</td>
           <td>{fmt(row.invoices)}</td>
           <td>{fmt(row.perFactura)}</td>
           <td>{fmt(row.compras)}</td>
-          <td>—</td>
-          <td>—</td>
+          <td>{BLANK}</td>
+          <td>{BLANK}</td>
         </tr>
       );
   }

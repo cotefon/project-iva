@@ -6,14 +6,14 @@
  *  /extract.pdf for the same document:
  *
  *    - blank padding, from extract_codes.fill_year_months: every year spans
- *      Ene-Dic, and a month with no F29 declaration shows dashes rather than a
+ *      Ene-Dic, and a month with no F29 declaration shows a hyphen rather than a
  *      computed zero — an unfiled month must never read as a month that
- *      declared nothing.
+ *      declared nothing. A month excluded by a period range pads the same way.
  *    - the Total row, and the deficit flag on its Compras cell.
  *    - the Promedio row, from api.py's _YearAggregator.
  */
 import { monthName, roundHalfEven } from "./format";
-import type { MonthRow, PeriodRange } from "../types";
+import type { MonthRow } from "../types";
 
 export type BlankRow = { kind: "blank"; month: number; name: string };
 export type DataRow = { kind: "data"; name: string; row: MonthRow };
@@ -53,27 +53,8 @@ export function groupByYear(months: MonthRow[]): Map<number, MonthRow[]> {
 const perInvoice = (total: number, invoices: number | null) =>
   !invoices ? null : roundHalfEven(total / invoices);
 
-/** The first and last month to show for `year`, mirroring PeriodRange.months_of
- *  in api.py: only the range's boundary years are clipped, so Mar 2023 - Ago
- *  2024 renders 2023 as Mar-Dic, 2024 as Ene-Ago, and anything between as a full
- *  Ene-Dic year. Without this the padding would print the months the server
- *  deliberately left out as undeclared ones. */
-function monthSpan(year: number, period?: PeriodRange): [number, number] {
-  const bound = (value: string | null | undefined, fallback: number) => {
-    if (!value) return fallback;
-    const [boundYear, boundMonth] = value.split("-").map(Number);
-    return boundYear === year ? boundMonth : fallback;
-  };
-  return [bound(period?.desde, 1), bound(period?.hasta, 12)];
-}
-
-function buildRows(
-  declared: MonthRow[],
-  year: number,
-  period?: PeriodRange,
-): TableRow[] {
+function buildRows(declared: MonthRow[]): TableRow[] {
   const byMonth = new Map(declared.map((m) => [m.month, m]));
-  const [first, last] = monthSpan(year, period);
 
   let totSales = 0;
   let totCompras = 0;
@@ -81,7 +62,10 @@ function buildRows(
   let declaredCount = 0; // the divisor for the monthly means — not always 12
 
   const rows: TableRow[] = [];
-  for (let month = first; month <= last; month++) {
+  // Always the twelve calendar months, matching fill_year_months' defaults. A
+  // month the range excludes pads exactly like one that was never declared: the
+  // range decides which months carry figures, not how many rows there are.
+  for (let month = 1; month <= 12; month++) {
     const row = byMonth.get(month);
     if (!row) {
       rows.push({ kind: "blank", month, name: monthName(month) });
@@ -121,12 +105,9 @@ function buildRows(
   return rows;
 }
 
-export function yearTables(
-  months: MonthRow[],
-  period?: PeriodRange,
-): YearTableData[] {
+export function yearTables(months: MonthRow[]): YearTableData[] {
   return [...groupByYear(months)].map(([year, declared]) => ({
     year,
-    rows: buildRows(declared, year, period),
+    rows: buildRows(declared),
   }));
 }

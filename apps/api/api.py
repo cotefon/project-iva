@@ -45,6 +45,7 @@ from pydantic import BaseModel, Field
 
 from auth import User, current_user
 from extract_codes import (
+    BLANK,
     COMPRAS_CODES,
     FORMULA_CODES,
     SPANISH_MONTHS,
@@ -105,6 +106,10 @@ class PeriodRange(NamedTuple):
 
     - The **accumulated** columns restart at `desde`, because they sum only the
       months on the report. A range starting in Mar 2023 accumulates from Mar.
+    - Every year table still spans **Ene-Dic**. A month outside the range is
+      padded like one that was never declared — a hyphen in each column,
+      contributing nothing — so a partial year always reads as twelve rows.
+      The range decides which months carry figures, not how many rows there are.
     - The **year-over-year** columns still compare against the same month a year
       earlier even when that month falls outside the range. The renderers
       therefore take both the narrowed rows and the full set: what is *rendered*
@@ -122,16 +127,6 @@ class PeriodRange(NamedTuple):
     def is_open(self) -> bool:
         """True when neither bound is set, i.e. the whole document is reported."""
         return self.desde is None and self.hasta is None
-
-    def months_of(self, year: int) -> tuple[int, int]:
-        """The (first, last) month to show for `year`, as fill_year_months bounds.
-
-        Only the boundary years are clipped: with Mar 2023 - Ago 2024, 2023 runs
-        Mar-Dic, 2024 runs Ene-Ago, and any year between them stays Ene-Dic.
-        """
-        first = self.desde[1] if self.desde and self.desde[0] == year else 1
-        last = self.hasta[1] if self.hasta and self.hasta[0] == year else 12
-        return first, last
 
     def as_json(self) -> dict:
         """The range as the frontend receives it: {"desde": "2023-03", ...}."""
@@ -229,9 +224,9 @@ def year_is_complete(year_rows: list[dict]) -> bool:
 def fmt(v) -> str:
     """Format an integer with Chilean dot thousands separators (e.g. 1.872.854).
 
-    None (a missing code) renders as an em dash.
+    None (a missing code) renders as BLANK.
     """
-    return "—" if v is None else f"{v:,}".replace(",", ".")
+    return BLANK if v is None else f"{v:,}".replace(",", ".")
 
 
 def avg_invoice(sales_k, invoices):
@@ -520,13 +515,13 @@ def _render_table(
         ]
         acc_sales = acc_compras = 0
         agg = _YearAggregator()
-        for r in fill_year_months(year, year_rows, *rng.months_of(year)):
+        for r in fill_year_months(year, year_rows):
             # Month not declared in the document: dashes across the row, and it
             # contributes nothing to the accumulators or the yearly totals.
             if r.get("blank"):
                 lines.append(
                     "| "
-                    + sep.join([r["month_name"]] + ["—"] * (len(header) - 1))
+                    + sep.join([r["month_name"]] + [BLANK] * (len(header) - 1))
                     + " |"
                 )
                 continue
@@ -540,7 +535,7 @@ def _render_table(
             compras = fmt(compras_k) + (" *" if r["missing_compras"] else "")
             row = [
                 r["month_name"],
-                r.get("folio") or "—",
+                r.get("folio") or BLANK,
                 sales,
                 fmt(acc_sales),
                 var_sales,
@@ -555,15 +550,15 @@ def _render_table(
         a = agg.averages()
         avg_row = [
             "**Promedio**",
-            "—",
+            BLANK,
             fmt(a.sales),
-            "—",
-            "—",
+            BLANK,
+            BLANK,
             fmt(a.invoices),
             fmt(a.per_factura),
             fmt(a.compras),
-            "—",
-            "—",
+            BLANK,
+            BLANK,
         ]
         lines.append("| " + sep.join(avg_row) + " |")
         lines.append("")
@@ -760,13 +755,13 @@ def build_pdf(
         pdf.set_left_margin(x0)
         pdf.set_xy(x0, y + HEAD_H)
 
-    # Core Helvetica is Latin-1, which excludes the em dash fmt()/format_variation
-    # use for a missing value, so render numeric cells with a plain hyphen.
+    # BLANK is a plain hyphen precisely because core Helvetica is Latin-1 and
+    # cannot encode an em dash, so these need no substitution of their own.
     def money(v):
-        return "-" if v is None else f"{v:,}".replace(",", ".")
+        return BLANK if v is None else f"{v:,}".replace(",", ".")
 
     def pct(prev, curr):
-        return format_variation(prev, curr).replace("—", "-")
+        return format_variation(prev, curr)
 
     has_incomplete = False
     bottom_y = 0.0
@@ -784,11 +779,11 @@ def build_pdf(
         acc_sales = acc_compras = 0
         complete = year_is_complete(year_rows)
         agg = _YearAggregator()
-        for r in fill_year_months(year, year_rows, *rng.months_of(year)):
+        for r in fill_year_months(year, year_rows):
             # Month not declared in the document: dashes across the row, and it
             # contributes nothing to the accumulators or the yearly totals.
             if r.get("blank"):
-                emit_row([r["month_name"]] + ["-"] * (len(columns) - 1), x0)
+                emit_row([r["month_name"]] + [BLANK] * (len(columns) - 1), x0)
                 continue
             _, sales_k, compras_k = row_in_thousands(r)
             prev_sales, prev_compras = prior_year(lookup, r)
@@ -804,7 +799,7 @@ def build_pdf(
                 has_incomplete = True
             cells = [
                 r["month_name"],
-                r.get("folio") or "-",
+                r.get("folio") or BLANK,
                 ventas,
                 money(acc_sales),
                 var_sales,
@@ -828,15 +823,15 @@ def build_pdf(
         emit_row(
             [
                 "Total",
-                "-",
+                BLANK,
                 money(acc_sales),
-                "-",
-                "-",
+                BLANK,
+                BLANK,
                 money(agg.tot_invoices or None),
-                "-",
+                BLANK,
                 money(acc_compras),
-                "-",
-                "-",
+                BLANK,
+                BLANK,
             ],
             x0,
             COMPRAS_COL if complete and acc_compras > acc_sales else None,
@@ -844,20 +839,20 @@ def build_pdf(
         # Per-year Promedio row: each cell is the mean of its own column over the
         # months actually declared, except Promedio de monto por factura, which
         # divides the year's Venta by its invoice count (code 503). Acumuladas
-        # and % Var have no meaningful mean ("-").
+        # and % Var have no meaningful mean (BLANK).
         a = agg.averages()
         emit_row(
             [
                 "Promedio",
-                "-",
+                BLANK,
                 money(a.sales),
-                "-",
-                "-",
+                BLANK,
+                BLANK,
                 money(a.invoices),
                 money(a.per_factura),
                 money(a.compras),
-                "-",
-                "-",
+                BLANK,
+                BLANK,
             ],
             x0,
         )
@@ -877,7 +872,7 @@ def build_pdf(
     # by the tallest table actually being drawn rather than by a fixed twelve —
     # a three-month report would otherwise leave two thirds of the page blank.
     tallest = max(
-        (len(fill_year_months(y, r, *rng.months_of(y))) for y, r in years), default=12
+        (len(fill_year_months(y, r)) for y, r in years), default=12
     )
     slot_pitch = TITLE_H + HEAD_H + (tallest + 2) * ROW_H + 6
 

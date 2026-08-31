@@ -159,6 +159,16 @@ it, and both matter when touching any renderer:
   earlier even when it falls outside the range. That is why the renderers take
   both `rows` (what to draw) and `all_rows` (what to look up in): filtering the
   lookup too would blank out the `% Var` column of the report's first year.
+- Every year table still spans **Ene–Dic**. A month the range excludes pads
+  exactly like one that was never declared — a hyphen in each column,
+  contributing to no total or average. The range decides which months carry
+  figures, not how many rows the table has, so a Mar–Ago report is twelve rows
+  with six of them filled. (This is why `PeriodRange` no longer has a
+  `months_of`, and `table.ts` no longer has a `monthSpan`.)
+
+One consequence worth stating: a month that is stored but outside the range
+renders identically to a month that was never declared. Both are hyphens. The
+report's own header line names the span, which is what distinguishes them.
 
 The filter is presentation only. `pdf_to_rows()` persists the whole document
 regardless, so narrowing a report never narrows what is stored.
@@ -176,13 +186,28 @@ screen, the Markdown report and the PDF agree. Three consequences when editing:
 - `apps/web/src/lib/format.ts` has `roundHalfEven`, because Python's `round()` breaks
   ties toward even and JavaScript's `Math.round` breaks them upward. Use it for
   anything mirroring a Python `round()`.
-- `table.ts`'s `monthSpan` mirrors `PeriodRange.months_of`: with a range in
-  force, only the boundary years are clipped. Get this wrong and the screen pads
-  months the server deliberately left out, showing them as undeclared.
+- Both sides pad every year to the full twelve months, unconditionally
+  (`fill_year_months`'s defaults on the Python side, a plain `1..12` loop in
+  `buildRows`). Neither consults the range.
 
 The period picker deliberately does **not** filter on the client. It re-requests
 `/report/{rut}`, because restarting the accumulated columns while still looking
 up the previous year needs rows the browser was never sent.
+
+### One dash, everywhere: `BLANK`
+
+Every cell with no value — an undeclared month, an undefined `% Var`, a missing
+folio, a Total/Promedio cell with no meaningful aggregate — prints
+`extract_codes.BLANK`, a plain hyphen. `apps/web/src/lib/format.ts` exports the
+same constant for the screen.
+
+It is a hyphen and not an em dash because the PDF's core Helvetica font is
+**Latin-1**, which has no em dash. That constraint used to be handled locally in
+`build_pdf` (its own `money()` plus a `.replace("—", "-")` on the variation),
+which meant the PDF and the screen printed different characters for the same
+empty cell. Now there is one constant and no substitution. Em dashes remain in
+*prose* — report titles, the explanatory paragraph above the CLI table — which
+never reaches the PDF.
 
 ### Key conventions
 
