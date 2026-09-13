@@ -1,0 +1,64 @@
+# Render Blueprint: both halves on the free tier.
+#
+#   iva-api  FastAPI service (free web service — sleeps after ~15 min idle,
+#            the first request after that takes ~1 min to wake it)
+#   iva-web  React bundle (free static site — never sleeps)
+#
+# Supabase stays where it is; nothing here provisions a database.
+#
+# Every `sync: false` value is prompted for when the Blueprint is first
+# applied and is never committed. The browser-facing pair must point at each
+# other: VITE_API_URL is the API's onrender.com URL, and ALLOWED_ORIGINS must
+# contain the static site's URL, or every call fails CORS.
+services:
+  - type: web
+    name: iva-api
+    runtime: python
+    plan: free
+    # uvicorn must start in apps/api so `api:app` and the flat imports between
+    # the service's modules resolve (same reason scripts/run-api.mjs sets cwd).
+    rootDir: apps/api
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: SUPABASE_URL
+        sync: false
+      # service_role key: server-side only, never put it on iva-web.
+      - key: SUPABASE_KEY
+        sync: false
+      # e.g. https://iva-web.onrender.com (no trailing slash)
+      - key: ALLOWED_ORIGINS
+        sync: false
+
+  - type: web
+    name: iva-web
+    runtime: static
+    # Built from the repo root because package-lock.json lives there (npm
+    # workspaces); buildFilter keeps API-only commits from rebuilding it.
+    buildCommand: npm ci && npm run build --workspace iva-web
+    staticPublishPath: apps/web/dist
+    buildFilter:
+      paths:
+        - apps/web/**
+        - package.json
+        - package-lock.json
+    # BrowserRouter: a reload on a deep link must still serve index.html.
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      # Vite 8 needs Node 20.19+ / 22.12+.
+      - key: NODE_VERSION
+        value: 22.12.0
+      # VITE_* values are inlined at build time: changing one needs a redeploy.
+      - key: VITE_SUPABASE_URL
+        sync: false
+      # anon / publishable key only — this ships to the browser.
+      - key: VITE_SUPABASE_ANON_KEY
+        sync: false
+      # e.g. https://iva-api.onrender.com
+      - key: VITE_API_URL
+        sync: false
